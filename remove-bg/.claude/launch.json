@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "remove-bg-ui",
+      "runtimeExecutable": ".venv/bin/python",
+      "runtimeArgs": ["server.py", "--no-warmup", "--port", "8778"],
+      "port": 8778
+    }
+  ]
+}
