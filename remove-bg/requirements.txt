@@ -1,0 +1,14 @@
+# direct dependencies; `requirements.lock.txt` has the exact set that was tested
+torch
+torchvision
+transformers
+timm
+einops
+kornia
+pillow
+pillow-heif      # iPhone .heic input
+pymatting        # foreground colour estimation, kills halos around hair
+huggingface_hub
+fastapi          # web UI only
+uvicorn[standard]
+python-multipart
