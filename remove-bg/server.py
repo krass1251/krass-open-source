@@ -3,9 +3,8 @@ Drag-and-drop web UI for rmbg.py. A local remove.bg, on localhost.
 
     ./run-ui.sh            # or: .venv/bin/python server.py
 
-Then open http://127.0.0.1:8777 and drop photos on the page. Nothing leaves
-the machine: the browser talks to 127.0.0.1 and images are never written to
-disk by the server.
+Then open http://127.0.0.1:8777 and drop photos on the page. The browser only
+ever talks to 127.0.0.1; nothing leaves the machine.
 
 Memory: a model loads on the first image that asks for it and is dropped
 again after --idle seconds without work for that model (default 60). Several
@@ -15,18 +14,31 @@ does not reload anything. A batch of photos in a row runs on the warm model.
 Loading costs ~1-4 s, unloading ~0.3 s. The x on a model chip (POST
 /api/unload with model=...) drops one model, "Free all" drops every one.
 
-The "Quit" button (POST /api/quit) stops the server, for when it was started
-from "Remove Background.app" (see make-app.sh) and there is no terminal.
+History: each result (original + cutout + settings) is kept under
+~/Library/Application Support/remove-bg/history for --history-days days
+(default 7, 0 keeps nothing on disk), so the page shows it again after a
+reload or a server restart, and Redo can rerun an old photo with another
+model. Delete on a card removes it from disk at once.
+
+Lifetime: the process exits after --exit-after minutes without a request
+(default 10, 0 = never). An open tab polls /api/status every 3 s, so the
+server lives while the page is open; the idle torch runtime alone is ~1 GB,
+which is why it does not stay around forever. "Quit" (POST /api/quit) stops
+it right away, for the app-launched case with no terminal (see make-app.sh).
 """
 
 import argparse
 import io
+import json
 import os
+import re
+import shutil
 import threading
 import time
+import uuid
 
-from fastapi import FastAPI, File, Form, UploadFile
-from fastapi.responses import HTMLResponse, Response
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from PIL import Image
 
 import rmbg
@@ -34,9 +46,32 @@ import rmbg
 app = FastAPI(title="remove-bg (local)")
 
 STATE = {"device": "auto", "fp32": False, "idle": 60, "last_used": {},
-         "size": None}
+         "size": None, "history_days": 7, "exit_after": 10,
+         "last_request": time.time()}
 GPU = threading.Lock()   # one inference at a time; also guards load/unload
+CANCELLED = {}           # job id -> time the client gave up on it
 
+HISTORY_DIR = os.path.expanduser("~/Library/Application Support/remove-bg/history")
+BROWSER_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}   # Chrome shows these; heic it does not
+
+# UI label, one-line hint, approximate download in MB. Order = order in the menus.
+MODEL_INFO = {
+    "hr-matting": ("HR matting (best)", "Best edges: hair, fur, glass, smoke. 2048px, the slowest.", 430),
+    "hr":         ("HR (crisp edges)", "Hard, clean edges at 2048px: products, logos, packshots.", 430),
+    "matting":    ("matting 1024 (fast)", "Soft edges at 1024px, about 4x faster. Fine for web-size photos.", 430),
+    "general":    ("general 1024", "All-round at 1024px with hard edges. Balanced speed and quality.", 430),
+    "portrait":   ("portrait", "Tuned for people, 1024px.", 430),
+    "lite":       ("lite (fastest)", "Small backbone, the fastest. Quick previews or a machine without GPU.", 170),
+}
+
+
+@app.middleware("http")
+async def note_activity(request, call_next):
+    STATE["last_request"] = time.time()
+    return await call_next(request)
+
+
+# ------------------------------------------------------------------ models
 
 def touch(model):
     STATE["last_used"][model] = time.time()
@@ -63,6 +98,24 @@ def loaded_models():
     return out
 
 
+def model_downloaded(name):
+    """(weights on disk?, MB in the hub cache) for one checkpoint."""
+    from huggingface_hub.constants import HF_HUB_CACHE
+
+    repo = rmbg.MODELS[name][0]
+    d = os.path.join(HF_HUB_CACHE, "models--" + repo.replace("/", "--"))
+    snaps = os.path.join(d, "snapshots")
+    if not os.path.isdir(snaps):
+        return False, 0
+    weights = any(f.endswith(".safetensors")
+                  for s in os.listdir(snaps)
+                  for f in os.listdir(os.path.join(snaps, s)))
+    blobs = os.path.join(d, "blobs")
+    total = sum(os.path.getsize(os.path.join(blobs, f))
+                for f in os.listdir(blobs)) if os.path.isdir(blobs) else 0
+    return weights, total // 2**20
+
+
 def idle_reaper():
     """Background thread: unload each model once it sat unused for --idle s."""
     while True:
@@ -76,6 +129,80 @@ def idle_reaper():
                 if model in loaded_names() and idle_for(model) >= STATE["idle"]:
                     rmbg.unload_model(model)
                     print(f"{model} unloaded after idle", flush=True)
+
+
+def exit_reaper():
+    """Background thread: exit the process after --exit-after quiet minutes."""
+    while True:
+        time.sleep(15)
+        mins = STATE["exit_after"]
+        if mins <= 0 or GPU.locked():
+            continue
+        if time.time() - STATE["last_request"] >= mins * 60:
+            print(f"no requests for {mins} min, exiting", flush=True)
+            os._exit(0)
+
+
+# ----------------------------------------------------------------- history
+
+def history_dir(hid):
+    if not re.fullmatch(r"[0-9a-f]{32}", hid):
+        raise HTTPException(404)
+    d = os.path.join(HISTORY_DIR, hid)
+    if not os.path.isfile(os.path.join(d, "meta.json")):
+        raise HTTPException(404)
+    return d
+
+
+def history_meta(hid):
+    with open(os.path.join(history_dir(hid), "meta.json")) as f:
+        return json.load(f)
+
+
+def history_save(raw, name, png, meta):
+    """Write original + cutout + meta; meta.json goes last so a half-written
+    entry is invisible to history_list()."""
+    hid = uuid.uuid4().hex
+    d = os.path.join(HISTORY_DIR, hid)
+    os.makedirs(d)
+    ext = os.path.splitext(name or "")[1].lower() or ".img"
+    with open(os.path.join(d, "orig" + ext), "wb") as f:
+        f.write(raw)
+    with open(os.path.join(d, "out.png"), "wb") as f:
+        f.write(png)
+    meta = dict(meta, id=hid, name=name, ext=ext, ts=time.time())
+    with open(os.path.join(d, "meta.json"), "w") as f:
+        json.dump(meta, f)
+    return hid
+
+
+def history_list():
+    """Every kept result, oldest first."""
+    items = []
+    if not os.path.isdir(HISTORY_DIR):
+        return items
+    for hid in os.listdir(HISTORY_DIR):
+        try:
+            with open(os.path.join(HISTORY_DIR, hid, "meta.json")) as f:
+                items.append(json.load(f))
+        except (OSError, ValueError):
+            continue
+    items.sort(key=lambda m: m["ts"])
+    return items
+
+
+def history_purge():
+    days = STATE["history_days"]
+    cutoff = time.time() - days * 86400
+    for m in history_list():
+        if days <= 0 or m["ts"] < cutoff:
+            shutil.rmtree(os.path.join(HISTORY_DIR, m["id"]), ignore_errors=True)
+
+
+def purge_reaper():
+    while True:
+        time.sleep(3600)
+        history_purge()
 
 
 PAGE = r"""<!doctype html>
@@ -136,6 +263,7 @@ PAGE = r"""<!doctype html>
       linear-gradient(45deg, #bbb 25%, #fff 25%, #fff 75%, #bbb 75%);
     background-size: 12px 12px; background-position: 0 0, 6px 6px;
   }
+  .hint { font-size: 12px; color: var(--muted); margin: 0 0 8px; }
   .cards { display: grid; gap: 14px; margin-top: 18px; }
   .card {
     background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
@@ -156,7 +284,9 @@ PAGE = r"""<!doctype html>
   .shot img { max-width: 100%; max-height: 100%; display: block; }
   .meta { grid-column: 1 / -1; display: flex; justify-content: space-between;
           font-size: 12px; color: var(--muted); }
-  .actions { display: flex; flex-direction: column; gap: 8px; }
+  .actions { display: flex; flex-direction: column; gap: 8px; min-width: 170px; }
+  .actions button, .actions select { width: 100%; }
+  .actions select { font-size: 12px; }
   button.go {
     font: inherit; border: 0; border-radius: 8px; padding: 8px 14px; cursor: pointer;
     background: var(--accent); color: var(--panel);
@@ -170,7 +300,7 @@ PAGE = r"""<!doctype html>
   @keyframes r { to { transform: rotate(360deg); } }
   .err { color: #c0392b; font-size: 13px; }
   .status {
-    display: flex; gap: 12px; align-items: center; margin-top: 10px;
+    display: flex; gap: 12px; align-items: center; margin-top: 10px; flex-wrap: wrap;
     font-size: 12px; color: var(--muted);
   }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--line); }
@@ -181,7 +311,7 @@ PAGE = r"""<!doctype html>
     background: transparent; color: var(--ink);
   }
   button.ghost[disabled] { opacity: .4; cursor: default; }
-  .status { flex-wrap: wrap; }
+  button.del:hover, button.cancel:hover { color: #c0392b; border-color: #c0392b; }
   .chips { display: flex; gap: 8px; flex-wrap: wrap; }
   .chip {
     display: inline-flex; gap: 6px; align-items: center; padding: 2px 3px 2px 9px;
@@ -195,7 +325,6 @@ PAGE = r"""<!doctype html>
   .chip .x:hover { background: var(--drop); color: var(--ink); }
   .chip .x[disabled] { opacity: .35; cursor: default; }
   .tag { color: var(--ink); font-weight: 600; }
-  .actions select { font-size: 12px; max-width: 170px; }
 </style>
 </head>
 <body>
@@ -220,18 +349,10 @@ PAGE = r"""<!doctype html>
       </div>
     </label>
     <label>Custom <input type="color" id="pick" value="#3f8cff"></label>
-    <label>Model
-      <select id="model">
-        <option value="hr-matting">HR matting (best)</option>
-        <option value="hr">HR (crisp edges)</option>
-        <option value="matting">matting 1024 (fast)</option>
-        <option value="general">general 1024</option>
-        <option value="portrait">portrait</option>
-        <option value="lite">lite (fastest)</option>
-      </select>
-    </label>
+    <label>Model <select id="model"></select></label>
     <label><input type="checkbox" id="tta"> extra pass (slower, cleaner)</label>
   </div>
+  <div class="hint" id="hint"></div>
 
   <div class="status">
     <span id="stat">checking…</span>
@@ -247,20 +368,81 @@ PAGE = r"""<!doctype html>
 const drop = document.getElementById('drop');
 const file = document.getElementById('file');
 const cards = document.getElementById('cards');
+const stat = document.getElementById('stat');
+const chips = document.getElementById('chips');
+const free = document.getElementById('free');
+const modelSel = document.getElementById('model');
+const ttaBox = document.getElementById('tta');
+const hint = document.getElementById('hint');
+const pick = document.getElementById('pick');
 let bg = '';
+let MODELS = [];
+const LABEL = {};
+let busy = 0;
+const working = {};   // model -> images in flight
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// ---- settings live in localStorage: model, background, extra pass
+const SKEY = 'rmbg.settings';
+function saveSettings() {
+  try {
+    localStorage.setItem(SKEY, JSON.stringify(
+      { model: modelSel.value, bg, tta: ttaBox.checked }));
+  } catch (e) {}
+}
+function setBg(v) {
+  bg = v;
+  let hit = false;
+  document.querySelectorAll('.sw').forEach(s => {
+    const on = s.dataset.bg === v;
+    s.setAttribute('aria-pressed', on); hit = hit || on;
+  });
+  if (!hit && v) pick.value = v;
+}
+function restoreSettings() {
+  let s = {};
+  try { s = JSON.parse(localStorage.getItem(SKEY)) || {}; } catch (e) {}
+  if (s.model in LABEL) modelSel.value = s.model;
+  ttaBox.checked = !!s.tta;
+  setBg(s.bg || '');
+  showHint();
+}
 
 document.getElementById('sw').addEventListener('click', e => {
   const b = e.target.closest('.sw'); if (!b) return;
-  document.querySelectorAll('.sw').forEach(s => s.setAttribute('aria-pressed', s === b));
-  bg = b.dataset.bg;
+  setBg(b.dataset.bg); saveSettings();
 });
-document.getElementById('pick').addEventListener('input', e => {
-  bg = e.target.value;
-  document.querySelectorAll('.sw').forEach(s => s.setAttribute('aria-pressed', false));
-});
+pick.addEventListener('input', e => { setBg(e.target.value); saveSettings(); });
+modelSel.addEventListener('change', () => { showHint(); saveSettings(); });
+ttaBox.addEventListener('change', saveSettings);
 
+// ---- models: labels, hints, what is already on disk
+function optionsHtml(selected) {
+  return MODELS.map(m =>
+    `<option value="${m.name}" title="${esc(m.hint)}"` +
+    `${m.name === selected ? ' selected' : ''}>${esc(m.label)}</option>`).join('');
+}
+async function loadModels() {
+  const cur = modelSel.value;
+  MODELS = (await (await fetch('/api/models')).json()).models;
+  MODELS.forEach(m => { LABEL[m.name] = m.label; });
+  modelSel.innerHTML = optionsHtml(cur in LABEL ? cur : MODELS[0].name);
+  showHint();
+}
+function showHint() {
+  const m = MODELS.find(x => x.name === modelSel.value); if (!m) return;
+  hint.textContent = m.hint + ' ' + (m.downloaded
+    ? `Downloaded (${m.size_mb} MB).`
+    : `Downloads ~${m.size_mb} MB on first use.`);
+}
+
+// ---- drop / pick / paste
 drop.addEventListener('click', () => file.click());
-file.addEventListener('change', () => handle(file.files));
+file.addEventListener('change', () => { handle(file.files); file.value = ''; });
 ['dragenter', 'dragover'].forEach(t => drop.addEventListener(t, e => {
   e.preventDefault(); drop.classList.add('hot');
 }));
@@ -272,19 +454,13 @@ window.addEventListener('paste', e => {
   const f = [...e.clipboardData.files]; if (f.length) handle(f);
 });
 
-const stat = document.getElementById('stat');
-const chips = document.getElementById('chips');
-const free = document.getElementById('free');
-const modelSel = document.getElementById('model');
-const LABEL = Object.fromEntries([...modelSel.options].map(o => [o.value, o.textContent]));
-let busy = 0;
-const working = {};   // model -> images in flight
-
-function esc(s) {
-  return String(s).replace(/[&<>"']/g, c =>
-    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+function handle(files) {
+  const opts = { model: modelSel.value, bg, tta: ttaBox.checked };
+  [...files].filter(f => f.type.startsWith('image/'))
+    .forEach(f => run({ file: f, name: f.name }, opts));
 }
 
+// ---- memory status
 async function refreshStatus() {
   let s;
   try { s = await (await fetch('/api/status')).json(); }
@@ -319,8 +495,7 @@ free.addEventListener('click', async () => {
   await fetch('/api/unload', { method: 'POST' });
   refreshStatus();
 });
-let statusTimer = setInterval(refreshStatus, 3000);
-refreshStatus();
+let statusTimer = null;
 document.getElementById('quit').addEventListener('click', async () => {
   if (busy && !confirm('Images are still processing. Quit anyway?')) return;
   clearInterval(statusTimer);
@@ -329,71 +504,152 @@ document.getElementById('quit').addEventListener('click', async () => {
     '<p class="sub">Server stopped. You can close this tab; open Remove Background again to start it.</p>';
 });
 
-function handle(files) {
-  const opts = { model: modelSel.value, bg, tta: document.getElementById('tta').checked };
-  [...files].filter(f => f.type.startsWith('image/')).forEach(f => run(f, opts));
-}
-
-// One card per (image, model) run. Redo runs the same image with the same
-// background and extra-pass setting through the model picked on the card, as
-// a new card right above it, so the two results sit next to each other.
-async function run(f, opts, anchor) {
+// ---- cards. One per (image, model) run; results also live in the server's
+// history, so a reload or a restart shows them again.
+function cardEl(name, opts) {
   const card = document.createElement('div');
   card.className = 'card';
-  const options = [...modelSel.options].map(o =>
-    `<option value="${o.value}"${o.value === opts.model ? ' selected' : ''}>` +
-    `${esc(o.textContent)}</option>`).join('');
   card.innerHTML = `
     <div class="shot"><img></div>
     <div class="shot checker"><div class="spin"></div></div>
     <div class="actions">
-      <button class="go" disabled>Save</button>
-      <select class="redo-model" title="model for Redo">${options}</select>
-      <button class="ghost redo">Redo with this model</button>
+      <button class="go save" disabled>Save</button>
+      <button class="ghost copy" disabled title="copy the PNG to the clipboard">Copy</button>
+      <select class="redo-model" title="model for Redo">${optionsHtml(opts.model)}</select>
+      <button class="ghost redo" disabled>Redo with this model</button>
+      <button class="ghost cancel">Cancel</button>
+      <button class="ghost del" hidden>Delete</button>
     </div>
     <div class="meta">
-      <span>${esc(f.name)} · <span class="tag">${esc(LABEL[opts.model] || opts.model)}</span>` +
+      <span>${esc(name)} · <span class="tag">${esc(LABEL[opts.model] || opts.model)}</span>` +
       `${opts.tta ? ' · extra pass' : ''}</span>
       <span class="t">working…</span>
     </div>`;
+  return card;
+}
+
+function flash(btn, text) {
+  const old = btn.textContent;
+  btn.textContent = text;
+  setTimeout(() => { btn.textContent = old; }, 1500);
+}
+
+// src: {file, name} for a photo from this session, {id, name} for one from
+// history. out: {id, url, blob?, seconds}. Redo of a stored result reads the
+// original back from the server, so it works after a reload too.
+function finish(card, src, opts, out) {
+  const [before, after] = card.querySelectorAll('.shot');
+  card.dataset.id = out.id || '';
+  after.innerHTML = `<img src="${out.url}" loading="lazy">`;
+  if (opts.bg) after.classList.remove('checker');
+  if (out.id && src.file) {
+    // heic: Chrome cannot show the original, the server sends a jpeg preview
+    const b = before.querySelector('img');
+    const orig = `/api/history/${out.id}/orig`;
+    b.onerror = () => { b.onerror = null; b.src = orig; };
+    if (b.complete && !b.naturalWidth) b.src = orig;
+  }
+  card.querySelector('.t').textContent = out.seconds.toFixed(1) + ' s';
+  card.querySelector('.cancel').hidden = true;
+  card.querySelector('.del').hidden = false;
+
+  const stem = src.name.replace(/\.[^.]+$/, '');
+  const save = card.querySelector('.save');
+  save.disabled = false;
+  save.onclick = () => {
+    const a = document.createElement('a');
+    a.href = out.url; a.download = `${stem}.${opts.model}.cutout.png`; a.click();
+  };
+  const copy = card.querySelector('.copy');
+  copy.disabled = false;
+  copy.onclick = async () => {
+    try {
+      const blob = out.blob || (out.blob = await (await fetch(out.url)).blob());
+      await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+      flash(copy, 'Copied');
+    } catch (e) { flash(copy, 'Copy failed'); }
+  };
+  const redo = card.querySelector('.redo');
+  if (src.file || out.id) {
+    redo.disabled = false;
+    redo.onclick = () => run(src.file ? src : { id: out.id, name: src.name },
+      { ...opts, model: card.querySelector('.redo-model').value }, card);
+  }
+  card.querySelector('.del').onclick = async () => {
+    if (out.id) await fetch(`/api/history/${out.id}`, { method: 'DELETE' });
+    card.remove();
+  };
+}
+
+async function run(src, opts, anchor) {
+  const card = cardEl(src.name, opts);
   if (anchor) anchor.before(card); else cards.prepend(card);
   const [before, after] = card.querySelectorAll('.shot');
-  before.querySelector('img').src = URL.createObjectURL(f);
-  card.querySelector('.redo').onclick = () =>
-    run(f, { ...opts, model: card.querySelector('.redo-model').value }, card);
+  before.querySelector('img').src =
+    src.file ? URL.createObjectURL(src.file) : `/api/history/${src.id}/orig`;
+
+  // cancel: drop the request client-side and tell the server to skip the
+  // job if it is still waiting for the GPU
+  const job = crypto.randomUUID();
+  const ctrl = new AbortController();
+  card.querySelector('.cancel').onclick = () => {
+    ctrl.abort();
+    const b = new FormData(); b.append('job', job);
+    fetch('/api/cancel', { method: 'POST', body: b });
+  };
 
   const body = new FormData();
-  body.append('image', f);
+  if (src.file) body.append('image', src.file); else body.append('source', src.id);
   body.append('bg', opts.bg);
   body.append('model', opts.model);
   body.append('tta', opts.tta ? '1' : '');
+  body.append('job', job);
 
   const t0 = performance.now();
   busy++; working[opts.model] = (working[opts.model] || 0) + 1; refreshStatus();
   try {
-    const res = await fetch('/api/cutout', { method: 'POST', body });
+    const res = await fetch('/api/cutout', { method: 'POST', body, signal: ctrl.signal });
     if (!res.ok) throw new Error(await res.text());
     const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    after.innerHTML = '<img src="' + url + '">';
-    if (opts.bg) after.classList.remove('checker');
-    const name = f.name.replace(/\.[^.]+$/, '') + `.${opts.model}.cutout.png`;
-    const btn = card.querySelector('.go');
-    btn.disabled = false;
-    btn.onclick = () => {
-      const a = document.createElement('a');
-      a.href = url; a.download = name; a.click();
-    };
-    card.querySelector('.t').textContent =
-      ((performance.now() - t0) / 1000).toFixed(1) + ' s';
+    finish(card, src, opts, {
+      id: res.headers.get('X-Id') || '', url: URL.createObjectURL(blob), blob,
+      seconds: (performance.now() - t0) / 1000,
+    });
+    const m = MODELS.find(x => x.name === opts.model);
+    if (m && !m.downloaded) loadModels();   // first use just fetched the weights
   } catch (err) {
+    if (err.name === 'AbortError') { card.remove(); return; }
     after.innerHTML = '<div class="err"></div>';
     after.querySelector('.err').textContent = err.message;
     card.querySelector('.t').textContent = 'failed';
+    card.querySelector('.cancel').hidden = true;
+    const del = card.querySelector('.del');
+    del.hidden = false; del.onclick = () => card.remove();
   } finally {
     busy--; working[opts.model]--; refreshStatus();
   }
 }
+
+async function loadHistory() {
+  let h;
+  try { h = await (await fetch('/api/history')).json(); } catch (e) { return; }
+  for (const it of h.items) {           // oldest first; prepend puts newest on top
+    const opts = { model: it.model, bg: it.bg, tta: it.tta };
+    const card = cardEl(it.name, opts);
+    cards.prepend(card);
+    card.querySelector('.shot img').src = `/api/history/${it.id}/orig`;
+    finish(card, { id: it.id, name: it.name }, opts,
+      { id: it.id, url: `/api/history/${it.id}/out`, seconds: it.seconds });
+  }
+}
+
+(async () => {
+  await loadModels();
+  restoreSettings();
+  refreshStatus();
+  statusTimer = setInterval(refreshStatus, 3000);
+  loadHistory();
+})();
 </script>
 </body>
 </html>
@@ -409,6 +665,17 @@ def index():
 def api_status():
     return {"loaded": loaded_models(), "idle": STATE["idle"],
             "ram_gb": round(rmbg.total_ram_gb())}
+
+
+@app.get("/api/models")
+def api_models():
+    out = []
+    for name, (label, hint, mb) in MODEL_INFO.items():
+        have, size = model_downloaded(name)
+        out.append({"name": name, "label": label, "hint": hint,
+                    "native": rmbg.MODELS[name][1],
+                    "downloaded": have, "size_mb": size if have else mb})
+    return {"models": out}
 
 
 @app.post("/api/unload")
@@ -429,21 +696,73 @@ def api_quit():
     return {"quit": True}
 
 
+@app.post("/api/cancel")
+def api_cancel(job: str = Form("")):
+    now = time.time()
+    if job:
+        CANCELLED[job] = now
+    for k in [k for k, t in CANCELLED.items() if now - t > 3600]:
+        del CANCELLED[k]
+    return {"cancelled": job}
+
+
+@app.get("/api/history")
+def api_history():
+    return {"items": history_list(), "days": STATE["history_days"]}
+
+
+@app.get("/api/history/{hid}/orig")
+def api_history_orig(hid: str):
+    d = history_dir(hid)
+    meta = history_meta(hid)
+    path = os.path.join(d, "orig" + meta["ext"])
+    if meta["ext"] in BROWSER_EXT:
+        return FileResponse(path)
+    preview = os.path.join(d, "preview.jpg")   # heic & co: browsers cannot show them
+    if not os.path.isfile(preview):
+        Image.open(path).convert("RGB").save(preview, quality=88)
+    return FileResponse(preview)
+
+
+@app.get("/api/history/{hid}/out")
+def api_history_out(hid: str):
+    return FileResponse(os.path.join(history_dir(hid), "out.png"))
+
+
+@app.delete("/api/history/{hid}")
+def api_history_delete(hid: str):
+    shutil.rmtree(history_dir(hid), ignore_errors=True)
+    return {"deleted": hid}
+
+
 @app.post("/api/cutout")
 def api_cutout(
-    image: UploadFile = File(...),
+    image: UploadFile | None = File(None),
+    source: str = Form(""),        # history id, instead of an upload (Redo)
     bg: str = Form(""),
     model: str = Form("hr-matting"),
     tta: str = Form(""),
+    job: str = Form(""),           # client id, so /api/cancel can skip it
 ):
     # sync endpoint on purpose: FastAPI runs it in a worker thread, so the
     # event loop keeps answering /api/status while the GPU is busy.
     if model not in rmbg.MODELS:
         return Response(f"unknown model {model!r}", status_code=400)
-    raw = image.file.read()
+    if image is not None:
+        raw, name = image.file.read(), image.filename or "image"
+    elif source:
+        meta = history_meta(source)
+        name = meta["name"]
+        with open(os.path.join(history_dir(source), "orig" + meta["ext"]), "rb") as f:
+            raw = f.read()
+    else:
+        return Response("no image", status_code=400)
     src = Image.open(io.BytesIO(raw)).convert("RGB")
 
+    t0 = time.time()
     with GPU:
+        if job in CANCELLED:
+            return Response("cancelled", status_code=499)
         touch(model)
         net, size, device, half = rmbg.load_model(
             model, rmbg.pick_device(STATE["device"]),
@@ -459,7 +778,14 @@ def api_cutout(
 
     buf = io.BytesIO()
     out.save(buf, format="PNG")
-    return Response(buf.getvalue(), media_type="image/png")
+    png = buf.getvalue()
+    headers = {"X-Seconds": f"{time.time() - t0:.2f}"}
+    if STATE["history_days"] > 0 and job not in CANCELLED:
+        headers["X-Id"] = history_save(raw, name, png, {
+            "model": model, "bg": bg, "tta": bool(tta),
+            "seconds": round(time.time() - t0, 2),
+            "width": src.width, "height": src.height})
+    return Response(png, media_type="image/png", headers=headers)
 
 
 def main():
@@ -471,14 +797,21 @@ def main():
     ap.add_argument("-s", "--size", type=int,
                     help="inference resolution (default follows RAM)")
     ap.add_argument("--idle", type=int, default=60,
-                    help="unload the model after this many idle seconds, 0 = never")
+                    help="unload a model after this many idle seconds, 0 = never")
+    ap.add_argument("--exit-after", type=int, default=10,
+                    help="exit after this many minutes without a request, 0 = never")
+    ap.add_argument("--history-days", type=int, default=7,
+                    help="keep results on disk this long, 0 = keep nothing")
     ap.add_argument("--no-warmup", action="store_true",
                     help="do not load the model at startup, wait for the first image")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--fp32", action="store_true")
     args = ap.parse_args()
 
-    STATE.update(device=args.device, fp32=args.fp32, idle=args.idle, size=args.size)
+    STATE.update(device=args.device, fp32=args.fp32, idle=args.idle, size=args.size,
+                 exit_after=args.exit_after, history_days=args.history_days,
+                 last_request=time.time())
+    history_purge()
     if not args.no_warmup:
         print(f"warming up {rmbg.MODELS[args.model][0]} ...", flush=True)
         rmbg.load_model(args.model, rmbg.pick_device(args.device),
@@ -487,7 +820,8 @@ def main():
     for m in loaded_models():
         print(f"{m['model']}: {m['precision']} at {m['size']}px on {m['device']}, "
               f"{rmbg.total_ram_gb():.0f} GB RAM, idle unload after {args.idle}s")
-    threading.Thread(target=idle_reaper, daemon=True).start()
+    for fn in (idle_reaper, exit_reaper, purge_reaper):
+        threading.Thread(target=fn, daemon=True).start()
     print(f"\n  open  http://{args.host}:{args.port}\n", flush=True)
 
     import uvicorn

@@ -38,11 +38,27 @@ machine's RAM automatically (see Memory below), so nothing needs tuning on a
 
 Open <http://127.0.0.1:8777>, then drop files on the page, click to pick them,
 or just press ⌘V to paste from the clipboard. Pick a background colour or keep
-transparency, hit **Save**. The model is loaded once at startup and stays in
-memory, so only the first image pays for the warm-up.
+transparency, hit **Save** or **Copy** (the PNG lands on the clipboard, ready
+for Figma, Telegram, Keynote). The model is loaded once at startup and stays
+in memory, so only the first image pays for the warm-up. **Cancel** on a card
+drops a job that has not started yet; the one already on the GPU finishes in
+a few seconds and is discarded.
 
-The browser talks to `127.0.0.1` and the server never writes your images to
-disk.
+The browser only ever talks to `127.0.0.1`; nothing leaves the machine.
+
+Model, background and extra pass are remembered between visits. The line
+under the toolbar says what the selected model is good for and whether its
+weights are on disk yet (each is a ~430 MB download on first use, lite 170).
+
+### History
+
+Every result is kept for 7 days in
+`~/Library/Application Support/remove-bg/history` (original + cutout), so the
+page shows the same cards after a reload or a server restart, and **Redo**
+still works on them. **Delete** on a card removes it from disk at once.
+`--history-days 30` keeps them longer, `--history-days 0` writes nothing to
+disk. Note that big photos make big PNGs: check the folder size if disk space
+is tight.
 
 ### As a Mac app, no terminal
 
@@ -50,12 +66,25 @@ disk.
 ./make-app.sh
 ```
 
-Builds `~/Applications/Remove Background.app`. Open it from Launchpad or
-Spotlight, or drag it to the Dock: it starts the server in the background if
-it is not running and opens the page in Chrome (default browser if Chrome is
-not installed). **Quit** on the page stops the server. Server output goes to
-`~/Library/Logs/remove-bg.log`. The app points at this folder, so re-run
-`make-app.sh` after moving the repo.
+Builds two things, both pointing at this folder (re-run after moving the
+repo; safe to re-run):
+
+* `~/Applications/Remove Background.app`. Open it from Launchpad or Spotlight,
+  or drag it to the Dock: it starts the server in the background if it is not
+  running (`serve.sh`) and opens the page in Chrome (default browser if Chrome
+  is not installed).
+* A Finder Quick Action **Remove Background**: right-click one or more photos
+  → Quick Actions → Remove Background, and `<name>.cutout.png` appears next to
+  each file (hr-matting, transparent). It goes through the same server, so
+  the warm model is reused and the results show up in the web UI's history
+  too. A notification reports how many were done.
+
+**Quit** on the page stops the server; otherwise it exits on its own after 10
+minutes without any request (`--exit-after 30` to change, `0` to keep it
+forever), since the idle torch runtime alone holds ~1 GB. An open tab keeps
+it alive. Server output goes to `~/Library/Logs/remove-bg.log`.
+
+### Memory
 
 The status line under the toolbar lists every model in memory, with its
 precision, resolution and when it frees itself. Each model unloads after 60 s
@@ -73,6 +102,8 @@ Saved files carry the model name, `photo.hr-matting.cutout.png`.
 ./run-ui.sh --idle 300        # keep the model 5 min after the last image
 ./run-ui.sh --no-warmup       # start instantly, load on the first image
 ./run-ui.sh -s 2048           # force a resolution
+./run-ui.sh --history-days 0  # keep nothing on disk
+./run-ui.sh --exit-after 0    # never exit on idle
 ```
 
 ## CLI
