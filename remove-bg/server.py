@@ -20,11 +20,13 @@ History: each result (original + cutout + settings) is kept under
 reload or a server restart, and Redo can rerun an old photo with another
 model. Delete on a card removes it from disk at once.
 
-Lifetime: the process exits after --exit-after minutes without a request
-(default 10, 0 = never). An open tab polls /api/status every 3 s, so the
-server lives while the page is open; the idle torch runtime alone is ~1 GB,
-which is why it does not stay around forever. "Quit" (POST /api/quit) stops
-it right away, for the app-launched case with no terminal (see make-app.sh).
+Sleep: after --sleep-after minutes without an image (default 10, 0 = never)
+the process exec()s into sleeper.py on the same port: the idle torch runtime
+alone is ~1 GB, the sleeper ~15 MB. Status polling from an open tab does not
+count as work, so tabs can stay open forever. The page (or serve.sh, or a
+fresh GET /) wakes it with POST /api/wake; the first image after that waits
+~3 s for the import plus the usual model load. "Quit" (POST /api/quit)
+stops the server for good, for the app-launched case with no terminal.
 """
 
 import argparse
@@ -33,6 +35,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import threading
 import time
 import uuid
@@ -46,11 +49,12 @@ import rmbg
 app = FastAPI(title="remove-bg (local)")
 
 STATE = {"device": "auto", "fp32": False, "idle": 60, "last_used": {},
-         "size": None, "history_days": 7, "exit_after": 10,
-         "last_request": time.time()}
+         "size": None, "history_days": 7, "sleep_after": 10,
+         "last_work": time.time()}
 GPU = threading.Lock()   # one inference at a time; also guards load/unload
 CANCELLED = {}           # job id -> time the client gave up on it
 
+SLEEPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sleeper.py")
 HISTORY_DIR = os.path.expanduser("~/Library/Application Support/remove-bg/history")
 BROWSER_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}   # Chrome shows these; heic it does not
 
@@ -65,16 +69,10 @@ MODEL_INFO = {
 }
 
 
-@app.middleware("http")
-async def note_activity(request, call_next):
-    STATE["last_request"] = time.time()
-    return await call_next(request)
-
-
 # ------------------------------------------------------------------ models
 
 def touch(model):
-    STATE["last_used"][model] = time.time()
+    STATE["last_used"][model] = STATE["last_work"] = time.time()
 
 
 def loaded_names():
@@ -131,16 +129,17 @@ def idle_reaper():
                     print(f"{model} unloaded after idle", flush=True)
 
 
-def exit_reaper():
-    """Background thread: exit the process after --exit-after quiet minutes."""
+def sleep_reaper():
+    """Background thread: after --sleep-after minutes without an image,
+    become sleeper.py (same PID, same port, ~15 MB instead of ~1 GB)."""
     while True:
         time.sleep(15)
-        mins = STATE["exit_after"]
+        mins = STATE["sleep_after"]
         if mins <= 0 or GPU.locked():
             continue
-        if time.time() - STATE["last_request"] >= mins * 60:
-            print(f"no requests for {mins} min, exiting", flush=True)
-            os._exit(0)
+        if time.time() - STATE["last_work"] >= mins * 60:
+            print(f"no work for {mins} min, going to sleep", flush=True)
+            os.execv(sys.executable, [sys.executable, SLEEPER, *sys.argv[1:]])
 
 
 # ----------------------------------------------------------------- history
@@ -358,6 +357,7 @@ PAGE = r"""<!doctype html>
     <span id="stat">checking…</span>
     <div class="chips" id="chips"></div>
     <button class="ghost" id="free" disabled>Free all</button>
+    <button class="ghost" id="wake" hidden>Wake up</button>
     <button class="ghost" id="quit">Quit</button>
   </div>
 
@@ -460,11 +460,20 @@ function handle(files) {
     .forEach(f => run({ file: f, name: f.name }, opts));
 }
 
-// ---- memory status
+// ---- memory status. After 10 min without work the server swaps itself for
+// a tiny sleeper on the same port; dropping a photo (or Wake up) brings it back.
+const wake = document.getElementById('wake');
 async function refreshStatus() {
   let s;
   try { s = await (await fetch('/api/status')).json(); }
   catch (e) { stat.textContent = 'server not reachable'; return; }
+  wake.hidden = !s.sleeping;
+  if (s.sleeping) {
+    chips.innerHTML = '';
+    stat.textContent = 'server sleeping · memory freed, wakes up on the next image';
+    free.disabled = true;
+    return;
+  }
   const loaded = new Set(s.loaded.map(m => m.model));
   const rows = s.loaded.map(m => {
     const w = working[m.model] > 0;
@@ -494,6 +503,26 @@ free.addEventListener('click', async () => {
   free.disabled = true;
   await fetch('/api/unload', { method: 'POST' });
   refreshStatus();
+});
+async function ensureAwake() {
+  let s = null;
+  try { s = await (await fetch('/api/status')).json(); } catch (e) {}
+  if (s && !s.sleeping) return;
+  if (!s) throw new Error('server not running: open Remove Background again');
+  fetch('/api/wake', { method: 'POST' }).catch(() => {});
+  for (let i = 0; i < 90; i++) {          // torch import takes a few seconds
+    await new Promise(r => setTimeout(r, 700));
+    try {
+      s = await (await fetch('/api/status')).json();
+      if (!s.sleeping) return;
+    } catch (e) {}
+  }
+  throw new Error('server did not wake up');
+}
+wake.addEventListener('click', async () => {
+  wake.disabled = true; stat.textContent = 'waking up…';
+  try { await ensureAwake(); } catch (e) { stat.textContent = e.message; }
+  wake.disabled = false; refreshStatus();
 });
 let statusTimer = null;
 document.getElementById('quit').addEventListener('click', async () => {
@@ -608,6 +637,8 @@ async function run(src, opts, anchor) {
   const t0 = performance.now();
   busy++; working[opts.model] = (working[opts.model] || 0) + 1; refreshStatus();
   try {
+    await ensureAwake();
+    if (ctrl.signal.aborted) throw new DOMException('cancelled', 'AbortError');
     const res = await fetch('/api/cutout', { method: 'POST', body, signal: ctrl.signal });
     if (!res.ok) throw new Error(await res.text());
     const blob = await res.blob();
@@ -687,6 +718,11 @@ def api_unload(model: str = Form("")):
         else:
             rmbg.unload_models()
     return {"loaded": loaded_models()}
+
+
+@app.post("/api/wake")
+def api_wake():
+    return {"waking": False}   # already awake; the sleeper answers this for real
 
 
 @app.post("/api/quit")
@@ -798,8 +834,9 @@ def main():
                     help="inference resolution (default follows RAM)")
     ap.add_argument("--idle", type=int, default=60,
                     help="unload a model after this many idle seconds, 0 = never")
-    ap.add_argument("--exit-after", type=int, default=10,
-                    help="exit after this many minutes without a request, 0 = never")
+    ap.add_argument("--sleep-after", type=int, default=10,
+                    help="swap to the ~15 MB sleeper.py after this many minutes "
+                         "without an image, 0 = never")
     ap.add_argument("--history-days", type=int, default=7,
                     help="keep results on disk this long, 0 = keep nothing")
     ap.add_argument("--no-warmup", action="store_true",
@@ -809,8 +846,8 @@ def main():
     args = ap.parse_args()
 
     STATE.update(device=args.device, fp32=args.fp32, idle=args.idle, size=args.size,
-                 exit_after=args.exit_after, history_days=args.history_days,
-                 last_request=time.time())
+                 sleep_after=args.sleep_after, history_days=args.history_days,
+                 last_work=time.time())
     history_purge()
     if not args.no_warmup:
         print(f"warming up {rmbg.MODELS[args.model][0]} ...", flush=True)
@@ -820,7 +857,7 @@ def main():
     for m in loaded_models():
         print(f"{m['model']}: {m['precision']} at {m['size']}px on {m['device']}, "
               f"{rmbg.total_ram_gb():.0f} GB RAM, idle unload after {args.idle}s")
-    for fn in (idle_reaper, exit_reaper, purge_reaper):
+    for fn in (idle_reaper, sleep_reaper, purge_reaper):
         threading.Thread(target=fn, daemon=True).start()
     print(f"\n  open  http://{args.host}:{args.port}\n", flush=True)
 

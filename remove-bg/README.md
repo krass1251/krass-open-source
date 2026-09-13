@@ -79,10 +79,13 @@ repo; safe to re-run):
   the warm model is reused and the results show up in the web UI's history
   too. A notification reports how many were done.
 
-**Quit** on the page stops the server; otherwise it exits on its own after 10
-minutes without any request (`--exit-after 30` to change, `0` to keep it
-forever), since the idle torch runtime alone holds ~1 GB. An open tab keeps
-it alive. Server output goes to `~/Library/Logs/remove-bg.log`.
+After 10 minutes without an image the server goes to sleep: the ~1 GB torch
+process swaps itself for `sleeper.py`, a ~15 MB stand-in on the same port
+(`--sleep-after 30` to change, `0` to never sleep). Open tabs do not keep it
+awake and do not go stale either: the page shows "server sleeping", and the
+next photo dropped on it (or **Wake up**) brings the real server back in a
+few seconds; so does opening the URL fresh, the app, or the Quick Action.
+**Quit** stops it for good. Server output goes to `~/Library/Logs/remove-bg.log`.
 
 ### Memory
 
@@ -103,7 +106,7 @@ Saved files carry the model name, `photo.hr-matting.cutout.png`.
 ./run-ui.sh --no-warmup       # start instantly, load on the first image
 ./run-ui.sh -s 2048           # force a resolution
 ./run-ui.sh --history-days 0  # keep nothing on disk
-./run-ui.sh --exit-after 0    # never exit on idle
+./run-ui.sh --sleep-after 0   # never swap to the sleeper
 ```
 
 ## CLI
