@@ -86,7 +86,7 @@ cutout on disk (`cut.png`), so the brush works on those too.
 Every result is kept for 7 days in
 `~/Library/Application Support/remove-bg/history` (original + cutout), so the
 page shows the same cards after a reload or a server restart, and **Redo**
-still works on them. **Delete** on a card removes it from disk at once.
+still works on them. The × in a card's corner removes it from disk at once.
 `--history-days 30` keeps them longer, `--history-days 0` writes nothing to
 disk. Note that big photos make big PNGs: check the folder size if disk space
 is tight.
@@ -128,7 +128,7 @@ Loading again costs about a second, so a batch of photos still runs on the
 warm model.
 
 Every result card says which model made it. To compare, pick another model on
-the card and hit **Redo with this model**: the same photo, background and
+the card and hit **Redo**: the same photo, background and
 extra-pass setting run again, and the new card lands right above the old one.
 Saved files carry the model name, `photo.hr-matting.cutout.png`.
 

@@ -307,10 +307,17 @@ PAGE = r"""<!doctype html>
   .hint { font-size: 12px; color: var(--muted); margin: 0 0 8px; }
   .cards { display: grid; gap: 14px; margin-top: 18px; }
   .card {
+    position: relative;
     background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
     padding: 14px; display: grid; grid-template-columns: 1fr 1fr auto; gap: 14px;
     align-items: center;
   }
+  .corner {
+    position: absolute; top: 6px; right: 6px; width: 24px; height: 24px; padding: 0;
+    border: 0; border-radius: 50%; background: transparent; color: var(--muted);
+    font: 18px/24px inherit; cursor: pointer;
+  }
+  .corner:hover { background: var(--drop); color: #c0392b; }
   @media (max-width: 720px) { .card { grid-template-columns: 1fr 1fr; } }
   .shot {
     aspect-ratio: 4 / 3; border-radius: 10px; overflow: hidden;
@@ -325,9 +332,13 @@ PAGE = r"""<!doctype html>
   .shot img { max-width: 100%; max-height: 100%; display: block; }
   .meta { grid-column: 1 / -1; display: flex; justify-content: space-between;
           font-size: 12px; color: var(--muted); }
-  .actions { display: flex; flex-direction: column; gap: 8px; min-width: 170px; }
-  .actions button, .actions select { width: 100%; }
-  .actions select { font-size: 12px; }
+  .actions { display: flex; flex-direction: column; gap: 8px; width: 236px; }
+  .actions .row { display: flex; gap: 8px; }
+  .actions .row > * { flex: 1 1 0; min-width: 0; }
+  .actions .row > select { flex: 1.6 1 0; }
+  .actions button.ghost { padding: 7px 8px; font-size: 13px; }
+  .actions select { font-size: 12px; padding: 4px 4px; }
+  .actions button.cancel { width: 100%; }
   button.go {
     font: inherit; border: 0; border-radius: 8px; padding: 8px 14px; cursor: pointer;
     background: var(--accent); color: var(--panel);
@@ -387,6 +398,12 @@ PAGE = r"""<!doctype html>
   #picker-img { max-width: 94vw; max-height: calc(100vh - 130px); display: block; user-select: none; }
   #picker-canvas { position: absolute; inset: 0; cursor: crosshair; }
   .pick-hint { font-size: 12px; color: #999; }
+  .ovl-close {
+    width: 34px; height: 34px; padding: 0; margin-left: 6px; border-radius: 50%;
+    border: 1px solid #555; background: transparent; color: #eee;
+    font: 22px/32px inherit; cursor: pointer;
+  }
+  .ovl-close:hover { background: #333; border-color: #888; }
 
   /* brush overlay: same frame as the picker, scrollable zoomable stage */
   #brush {
@@ -459,8 +476,8 @@ PAGE = r"""<!doctype html>
       <button class="ghost" id="picker-reset" disabled>Reset</button>
     </span>
     <span class="pick-tools">
-      <button class="ghost" id="picker-cancel">Cancel</button>
       <button class="go" id="picker-go" disabled>Redo with selection</button>
+      <button class="ovl-close" id="picker-close" title="close without applying (Esc)">×</button>
     </span>
   </div>
   <div class="pick-stage"><img id="picker-img" draggable="false"><canvas id="picker-canvas"></canvas></div>
@@ -486,8 +503,8 @@ PAGE = r"""<!doctype html>
       <button class="ghost" id="br-zoomout" title="zoom out">−</button>
       <button class="ghost" id="br-zoomfit" title="fit to screen">fit</button>
       <button class="ghost" id="br-zoomin" title="zoom in">+</button>
-      <button class="ghost" id="br-cancel">Cancel</button>
       <button class="go" id="br-go" disabled>Apply changes</button>
+      <button class="ovl-close" id="br-close" title="close without applying (Esc)">×</button>
     </span>
   </div>
   <div class="br-wrap">
@@ -676,15 +693,21 @@ function cardEl(name, opts) {
     <div class="shot"><img></div>
     <div class="shot checker"><div class="spin"></div></div>
     <div class="actions">
-      <button class="go save" disabled>Save</button>
-      <button class="ghost copy" disabled title="copy the PNG to the clipboard">Copy</button>
-      <select class="redo-model" title="model for Redo">${optionsHtml(opts.model)}</select>
-      <button class="ghost redo" disabled>Redo with this model</button>
-      <button class="ghost pickobj" disabled title="click on the object to keep, for photos with several things in them">Pick object</button>
-      <button class="ghost touchup" disabled title="brush: bring parts back or erase them by hand">Touch up</button>
+      <div class="row">
+        <button class="go save" disabled title="download the PNG">Save</button>
+        <button class="ghost copy" disabled title="copy the PNG to the clipboard">Copy</button>
+      </div>
+      <div class="row">
+        <button class="ghost pickobj" disabled title="click on the object to keep, for photos with several things in them">Pick object</button>
+        <button class="ghost touchup" disabled title="brush: bring parts back or erase them by hand">Touch up</button>
+      </div>
+      <div class="row">
+        <select class="redo-model" title="model for Redo">${optionsHtml(opts.model)}</select>
+        <button class="ghost redo" disabled title="run this photo again with the model on the left">Redo</button>
+      </div>
       <button class="ghost cancel">Cancel</button>
-      <button class="ghost del" hidden>Delete</button>
     </div>
+    <button class="corner del" hidden title="delete this result">×</button>
     <div class="meta">
       <span>${esc(name)} · <span class="tag">${esc(LABEL[opts.model] || opts.model)}</span>` +
       `${opts.tta ? ' · extra pass' : ''}` +
@@ -933,7 +956,7 @@ document.querySelectorAll('#picker .tool').forEach(b => b.addEventListener('clic
 }));
 pk.undo.addEventListener('click', () => { pk.points.pop(); refreshMask(); });
 pk.reset.addEventListener('click', () => { pk.points = []; refreshMask(); });
-document.getElementById('picker-cancel').addEventListener('click', closePicker);
+document.getElementById('picker-close').addEventListener('click', closePicker);
 pk.go.addEventListener('click', () => {
   const { src, opts, anchor, points } = pk;
   closePicker();
@@ -986,7 +1009,10 @@ async function openBrush(src, opts, anchor) {
     br.msg.textContent = 'Paint over what to bring back or erase';
   } catch (e) { br.msg.textContent = 'Failed: ' + e.message; }
 }
-function closeBrush() { br.el.hidden = true; br.base = br.orig = null; br.work.width = 1; }
+function closeBrush() {
+  if (br.strokes.length && !confirm('Discard the brush changes?')) return;
+  br.el.hidden = true; br.base = br.orig = null; br.strokes = []; br.work.width = 1;
+}
 function brushButtons() {
   br.undo.disabled = !br.strokes.length; br.redo.disabled = !br.undone.length;
   br.reset.disabled = !br.strokes.length; br.go.disabled = !br.strokes.length;
@@ -1107,11 +1133,12 @@ br.reset.addEventListener('click', () => { br.strokes = []; br.undone = []; repl
 document.getElementById('br-zoomin').addEventListener('click', () => setZoom('in'));
 document.getElementById('br-zoomout').addEventListener('click', () => setZoom('out'));
 document.getElementById('br-zoomfit').addEventListener('click', () => setZoom('fit'));
-document.getElementById('br-cancel').addEventListener('click', closeBrush);
+document.getElementById('br-close').addEventListener('click', closeBrush);
 br.go.addEventListener('click', async () => {
   br.go.disabled = true; br.msg.textContent = 'Saving…';
   const blob = await new Promise(r => br.work.toBlob(r, 'image/png'));
   const { src, opts, anchor, strokes } = br;
+  br.strokes = [];            // applied, nothing to discard
   closeBrush();
   run(src, { ...opts, edited: true }, anchor, { url: '/api/edit', blob, strokes: strokes.length });
 });
