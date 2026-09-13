@@ -55,7 +55,8 @@ weights are on disk yet (each is a ~430 MB download on first use, lite 170).
 BiRefNet decides by itself what the subject is, which is right most of the
 time. When a photo has several things in it, **Pick object** on a card opens
 the photo large: click the object to keep, ⌥-click (or right-click) parts to
-drop, the selection shows at once; **Cut out** makes a new card with only
+drop; what stays is shown bright with a green outline, what goes is dimmed.
+**Redo with selection** makes a new card with only
 that object. Clicks are remembered with the result, so Redo with another
 model keeps the same object and Pick object on that card starts from them.
 

@@ -428,11 +428,11 @@ PAGE = r"""<!doctype html>
     </span>
     <span class="pick-tools">
       <button class="ghost" id="picker-cancel">Cancel</button>
-      <button class="go" id="picker-go" disabled>Cut out</button>
+      <button class="go" id="picker-go" disabled>Redo with selection</button>
     </span>
   </div>
   <div class="pick-stage"><img id="picker-img" draggable="false"><canvas id="picker-canvas"></canvas></div>
-  <div class="pick-hint">click = keep · ⌥-click or right-click = exclude · ⌘Z undo · Enter cuts out · Esc closes</div>
+  <div class="pick-hint">click = keep · ⌥-click or right-click = exclude · ⌘Z undo · Enter applies · Esc closes</div>
 </div>
 
 <script>
@@ -756,7 +756,7 @@ async function loadHistory() {
 }
 
 // ---- click-to-select overlay (SAM 2). Clicks are in original image pixels;
-// the server returns a mask preview, Cut out runs BiRefNet on the picked
+// the server returns a mask preview, Redo with selection runs BiRefNet on the picked
 // object as a new card above the one it came from.
 const pk = {
   el: document.getElementById('picker'), img: document.getElementById('picker-img'),
@@ -774,7 +774,7 @@ function openPicker(src, opts, anchor) {
   pk.msg.textContent = 'Click the object you want to keep';
   document.querySelector('.pick-hint').textContent = (sam.downloaded ? '' :
     `first use downloads SAM 2 (~${sam.size_mb} MB) · `) +
-    'click = keep · ⌥-click or right-click = exclude · ⌘Z undo · Enter cuts out · Esc closes';
+    'click = keep · ⌥-click or right-click = exclude · ⌘Z undo · Enter applies · Esc closes';
   pickButtons();
   if (opts.points && opts.points.length) {      // re-open a picked card: start from its clicks
     pk.points = opts.points.map(p => [...p]);
@@ -799,13 +799,24 @@ function drawPick() {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, c.width, c.height);
   if (pk.mask) {
+    // kept = full brightness with a green outline, removed = dimmed hard
     ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
-    ctx.fillStyle = 'rgba(0,0,0,.5)'; ctx.fillRect(0, 0, c.width, c.height);   // dim everything
-    ctx.globalCompositeOperation = 'destination-out';                          // ...but the object
+    ctx.fillStyle = 'rgba(0,0,0,.72)'; ctx.fillRect(0, 0, c.width, c.height);
+    ctx.globalCompositeOperation = 'destination-out';
     ctx.drawImage(pk.mask, 0, 0, c.width, c.height);
-    ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = .28;      // and tint it
-    ctx.drawImage(pk.mask, 0, 0, c.width, c.height);
-    ctx.globalAlpha = 1;
+    // outline: the mask in green, grown by d px, minus the mask itself
+    const d = Math.max(2, Math.round(c.width / 500));
+    const shape = document.createElement('canvas'); shape.width = c.width; shape.height = c.height;
+    const sc = shape.getContext('2d');
+    sc.drawImage(pk.mask, 0, 0, c.width, c.height);
+    sc.globalCompositeOperation = 'source-in'; sc.fillStyle = '#3ddc84'; sc.fillRect(0, 0, c.width, c.height);
+    const ring = document.createElement('canvas'); ring.width = c.width; ring.height = c.height;
+    const rc = ring.getContext('2d');
+    for (const [dx, dy] of [[d, 0], [-d, 0], [0, d], [0, -d], [d, d], [-d, -d], [d, -d], [-d, d]])
+      rc.drawImage(shape, dx, dy);
+    rc.globalCompositeOperation = 'destination-out'; rc.drawImage(shape, 0, 0);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.drawImage(ring, 0, 0);
   }
   const sx = c.width / pk.img.naturalWidth, sy = c.height / pk.img.naturalHeight;
   const rad = 6 * (window.devicePixelRatio || 1);
@@ -830,7 +841,7 @@ async function refreshMask() {
     await img.decode();
     if (seq !== pk.seq) return;                 // a newer click already answered
     pk.mask = img;
-    pk.msg.textContent = 'Selected · click more to refine, ⌥-click to exclude';
+    pk.msg.textContent = 'Bright with green outline = kept, dark = removed · click to add, ⌥-click to exclude';
   } catch (e) {
     if (seq !== pk.seq) return;
     pk.msg.textContent = 'Failed: ' + e.message;
