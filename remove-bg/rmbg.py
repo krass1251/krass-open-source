@@ -120,17 +120,28 @@ def load_model(model="hr-matting", device=None, half=None):
     return _LOADED[key]
 
 
-def unload_models():
-    """Drop every loaded checkpoint and give the memory back to the OS.
-    Takes ~0.3 s; the next load_model() costs ~1-4 s again."""
+def _release_memory():
     import gc
 
-    _LOADED.clear()
     gc.collect()
     if torch.backends.mps.is_available():
         torch.mps.empty_cache()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def unload_models():
+    """Drop every loaded checkpoint and give the memory back to the OS.
+    Takes ~0.3 s; the next load_model() costs ~1-4 s again."""
+    _LOADED.clear()
+    _release_memory()
+
+
+def unload_model(model):
+    """Drop one checkpoint (every device/precision variant of it), keep the rest."""
+    for key in [k for k in _LOADED if k[0] == model]:
+        del _LOADED[key]
+    _release_memory()
 
 
 # ------------------------------------------------------------------- matting

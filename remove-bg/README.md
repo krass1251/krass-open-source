@@ -44,10 +44,30 @@ memory, so only the first image pays for the warm-up.
 The browser talks to `127.0.0.1` and the server never writes your images to
 disk.
 
-The status line under the toolbar shows whether the model is in memory. It
-unloads itself after 60 s without work (`--idle 120` to change, `--idle 0` to
-keep it forever); **Free memory** drops it right away. Loading again costs
-about a second, so a batch of photos still runs on the warm model.
+### As a Mac app, no terminal
+
+```bash
+./make-app.sh
+```
+
+Builds `~/Applications/Remove Background.app`. Open it from Launchpad or
+Spotlight, or drag it to the Dock: it starts the server in the background if
+it is not running and opens the page in Chrome (default browser if Chrome is
+not installed). **Quit** on the page stops the server. Server output goes to
+`~/Library/Logs/remove-bg.log`. The app points at this folder, so re-run
+`make-app.sh` after moving the repo.
+
+The status line under the toolbar lists every model in memory, with its
+precision, resolution and when it frees itself. Each model unloads after 60 s
+without work of its own (`--idle 120` to change, `--idle 0` to keep them
+forever); the × on a model drops just that one, **Free all** drops every one.
+Loading again costs about a second, so a batch of photos still runs on the
+warm model.
+
+Every result card says which model made it. To compare, pick another model on
+the card and hit **Redo with this model**: the same photo, background and
+extra-pass setting run again, and the new card lands right above the old one.
+Saved files carry the model name, `photo.hr-matting.cutout.png`.
 
 ```
 ./run-ui.sh --idle 300        # keep the model 5 min after the last image

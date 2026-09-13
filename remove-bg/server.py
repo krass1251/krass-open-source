@@ -7,15 +7,21 @@ Then open http://127.0.0.1:8777 and drop photos on the page. Nothing leaves
 the machine: the browser talks to 127.0.0.1 and images are never written to
 disk by the server.
 
-Memory: the model loads on the first image and is dropped again after
---idle seconds without work (default 60). A batch of photos in a row runs on
-the warm model; a minute later the ~8-16 GB it holds are back. Loading costs
-~1-4 s, unloading ~0.3 s, so this is cheaper than reloading per image. The
-"Free memory" button and POST /api/unload do the same by hand.
+Memory: a model loads on the first image that asks for it and is dropped
+again after --idle seconds without work for that model (default 60). Several
+models can sit in memory at once (weights are ~0.5 GB each; the 4-16 GB peak
+is activations, released after every image), so switching models to compare
+does not reload anything. A batch of photos in a row runs on the warm model.
+Loading costs ~1-4 s, unloading ~0.3 s. The x on a model chip (POST
+/api/unload with model=...) drops one model, "Free all" drops every one.
+
+The "Quit" button (POST /api/quit) stops the server, for when it was started
+from "Remove Background.app" (see make-app.sh) and there is no terminal.
 """
 
 import argparse
 import io
+import os
 import threading
 import time
 
@@ -27,37 +33,49 @@ import rmbg
 
 app = FastAPI(title="remove-bg (local)")
 
-STATE = {"device": "auto", "fp32": False, "idle": 60, "last_used": 0.0,
+STATE = {"device": "auto", "fp32": False, "idle": 60, "last_used": {},
          "size": None}
 GPU = threading.Lock()   # one inference at a time; also guards load/unload
 
 
-def touch():
-    STATE["last_used"] = time.time()
+def touch(model):
+    STATE["last_used"][model] = time.time()
 
 
-def loaded_info():
-    """What is in memory right now, for /api/status."""
-    if not rmbg._LOADED:
-        return None
-    (model, device, half), (_, size, _, _) = next(iter(rmbg._LOADED.items()))
-    return {"model": model, "device": device,
-            "precision": "fp16" if half else "fp32",
-            "size": STATE["size"] or size}
+def loaded_names():
+    return {key[0] for key in list(rmbg._LOADED)}
+
+
+def idle_for(model):
+    return time.time() - STATE["last_used"].get(model, 0)
+
+
+def loaded_models():
+    """What is in memory right now, for /api/status: one entry per model."""
+    out = []
+    for (model, device, half), (_, size, _, _) in list(rmbg._LOADED.items()):
+        left = None
+        if STATE["idle"] > 0:
+            left = max(0, int(STATE["idle"] - idle_for(model)))
+        out.append({"model": model, "device": device,
+                    "precision": "fp16" if half else "fp32",
+                    "size": STATE["size"] or size, "unload_in": left})
+    return out
 
 
 def idle_reaper():
-    """Background thread: unload the model once it sat unused for --idle s."""
+    """Background thread: unload each model once it sat unused for --idle s."""
     while True:
         time.sleep(2)
-        if not rmbg._LOADED or STATE["idle"] <= 0:
+        if STATE["idle"] <= 0:
             continue
-        if time.time() - STATE["last_used"] < STATE["idle"]:
-            continue
-        with GPU:
-            if rmbg._LOADED and time.time() - STATE["last_used"] >= STATE["idle"]:
-                rmbg.unload_models()
-                print("model unloaded after idle", flush=True)
+        for model in loaded_names():
+            if idle_for(model) < STATE["idle"]:
+                continue
+            with GPU:
+                if model in loaded_names() and idle_for(model) >= STATE["idle"]:
+                    rmbg.unload_model(model)
+                    print(f"{model} unloaded after idle", flush=True)
 
 
 PAGE = r"""<!doctype html>
@@ -163,6 +181,21 @@ PAGE = r"""<!doctype html>
     background: transparent; color: var(--ink);
   }
   button.ghost[disabled] { opacity: .4; cursor: default; }
+  .status { flex-wrap: wrap; }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; }
+  .chip {
+    display: inline-flex; gap: 6px; align-items: center; padding: 2px 3px 2px 9px;
+    border: 1px solid var(--line); border-radius: 999px; background: var(--panel);
+  }
+  .chip b { color: var(--ink); font-weight: 600; }
+  .chip .x {
+    font: inherit; line-height: 1; border: 0; background: transparent;
+    color: var(--muted); cursor: pointer; padding: 3px 6px; border-radius: 999px;
+  }
+  .chip .x:hover { background: var(--drop); color: var(--ink); }
+  .chip .x[disabled] { opacity: .35; cursor: default; }
+  .tag { color: var(--ink); font-weight: 600; }
+  .actions select { font-size: 12px; max-width: 170px; }
 </style>
 </head>
 <body>
@@ -192,6 +225,7 @@ PAGE = r"""<!doctype html>
         <option value="hr-matting">HR matting (best)</option>
         <option value="hr">HR (crisp edges)</option>
         <option value="matting">matting 1024 (fast)</option>
+        <option value="general">general 1024</option>
         <option value="portrait">portrait</option>
         <option value="lite">lite (fastest)</option>
       </select>
@@ -200,9 +234,10 @@ PAGE = r"""<!doctype html>
   </div>
 
   <div class="status">
-    <span class="dot" id="dot"></span>
     <span id="stat">checking…</span>
-    <button class="ghost" id="free" disabled>Free memory</button>
+    <div class="chips" id="chips"></div>
+    <button class="ghost" id="free" disabled>Free all</button>
+    <button class="ghost" id="quit">Quit</button>
   </div>
 
   <div class="cards" id="cards"></div>
@@ -238,72 +273,111 @@ window.addEventListener('paste', e => {
 });
 
 const stat = document.getElementById('stat');
-const dot = document.getElementById('dot');
+const chips = document.getElementById('chips');
 const free = document.getElementById('free');
+const modelSel = document.getElementById('model');
+const LABEL = Object.fromEntries([...modelSel.options].map(o => [o.value, o.textContent]));
 let busy = 0;
+const working = {};   // model -> images in flight
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
 
 async function refreshStatus() {
-  try {
-    const s = await (await fetch('/api/status')).json();
-    if (s.loaded) {
-      const m = s.loaded;
-      let txt = `model in memory · ${m.model}, ${m.precision}, ${m.size}px`;
-      if (busy) txt += ' · working';
-      else if (s.unload_in !== null) txt += ` · frees itself in ${s.unload_in}s`;
-      stat.textContent = txt;
-      dot.classList.add('on');
-      free.disabled = busy > 0;
-    } else if (busy) {
-      stat.textContent = 'loading model…';
-      dot.classList.remove('on');
-      free.disabled = true;
-    } else {
-      stat.textContent = `memory free · model loads on the next image (${s.ram_gb} GB RAM)`;
-      dot.classList.remove('on');
-      free.disabled = true;
-    }
-  } catch (e) { stat.textContent = 'server not reachable'; }
+  let s;
+  try { s = await (await fetch('/api/status')).json(); }
+  catch (e) { stat.textContent = 'server not reachable'; return; }
+  const loaded = new Set(s.loaded.map(m => m.model));
+  const rows = s.loaded.map(m => {
+    const w = working[m.model] > 0;
+    const when = w ? 'working' : m.unload_in !== null ? `frees in ${m.unload_in}s` : 'kept';
+    return `<span class="chip"><span class="dot on"></span><b>${esc(m.model)}</b>` +
+      ` ${m.precision} · ${m.size}px · ${when}` +
+      `<button class="x" data-model="${esc(m.model)}" title="unload ${esc(m.model)}"` +
+      `${w ? ' disabled' : ''}>×</button></span>`;
+  });
+  for (const [m, n] of Object.entries(working))
+    if (n > 0 && !loaded.has(m))
+      rows.push(`<span class="chip"><span class="dot"></span><b>${esc(m)}</b> loading…&nbsp;</span>`);
+  chips.innerHTML = rows.join('');
+  stat.textContent = s.loaded.length ? 'in memory:'
+    : busy ? '' : `memory free · a model loads on the next image (${s.ram_gb} GB RAM)`;
+  free.disabled = busy > 0 || s.loaded.length === 0;
 }
+chips.addEventListener('click', async e => {
+  const b = e.target.closest('.x'); if (!b) return;
+  b.disabled = true;
+  const body = new FormData();
+  body.append('model', b.dataset.model);
+  await fetch('/api/unload', { method: 'POST', body });
+  refreshStatus();
+});
 free.addEventListener('click', async () => {
   free.disabled = true;
   await fetch('/api/unload', { method: 'POST' });
   refreshStatus();
 });
+let statusTimer = setInterval(refreshStatus, 3000);
 refreshStatus();
-setInterval(refreshStatus, 3000);
+document.getElementById('quit').addEventListener('click', async () => {
+  if (busy && !confirm('Images are still processing. Quit anyway?')) return;
+  clearInterval(statusTimer);
+  try { await fetch('/api/quit', { method: 'POST' }); } catch (e) {}
+  document.querySelector('main').innerHTML =
+    '<p class="sub">Server stopped. You can close this tab; open Remove Background again to start it.</p>';
+});
 
 function handle(files) {
-  [...files].filter(f => f.type.startsWith('image/')).forEach(run);
+  const opts = { model: modelSel.value, bg, tta: document.getElementById('tta').checked };
+  [...files].filter(f => f.type.startsWith('image/')).forEach(f => run(f, opts));
 }
 
-async function run(f) {
+// One card per (image, model) run. Redo runs the same image with the same
+// background and extra-pass setting through the model picked on the card, as
+// a new card right above it, so the two results sit next to each other.
+async function run(f, opts, anchor) {
   const card = document.createElement('div');
   card.className = 'card';
+  const options = [...modelSel.options].map(o =>
+    `<option value="${o.value}"${o.value === opts.model ? ' selected' : ''}>` +
+    `${esc(o.textContent)}</option>`).join('');
   card.innerHTML = `
     <div class="shot"><img></div>
     <div class="shot checker"><div class="spin"></div></div>
-    <div class="actions"><button class="go" disabled>Save</button></div>
-    <div class="meta"><span>${f.name}</span><span class="t">working…</span></div>`;
-  cards.prepend(card);
+    <div class="actions">
+      <button class="go" disabled>Save</button>
+      <select class="redo-model" title="model for Redo">${options}</select>
+      <button class="ghost redo">Redo with this model</button>
+    </div>
+    <div class="meta">
+      <span>${esc(f.name)} · <span class="tag">${esc(LABEL[opts.model] || opts.model)}</span>` +
+      `${opts.tta ? ' · extra pass' : ''}</span>
+      <span class="t">working…</span>
+    </div>`;
+  if (anchor) anchor.before(card); else cards.prepend(card);
   const [before, after] = card.querySelectorAll('.shot');
   before.querySelector('img').src = URL.createObjectURL(f);
+  card.querySelector('.redo').onclick = () =>
+    run(f, { ...opts, model: card.querySelector('.redo-model').value }, card);
 
   const body = new FormData();
   body.append('image', f);
-  body.append('bg', bg);
-  body.append('model', document.getElementById('model').value);
-  body.append('tta', document.getElementById('tta').checked ? '1' : '');
+  body.append('bg', opts.bg);
+  body.append('model', opts.model);
+  body.append('tta', opts.tta ? '1' : '');
 
   const t0 = performance.now();
-  busy++; refreshStatus();
+  busy++; working[opts.model] = (working[opts.model] || 0) + 1; refreshStatus();
   try {
     const res = await fetch('/api/cutout', { method: 'POST', body });
     if (!res.ok) throw new Error(await res.text());
     const blob = await res.blob();
     const url = URL.createObjectURL(blob);
     after.innerHTML = '<img src="' + url + '">';
-    if (bg) after.classList.remove('checker');
-    const name = f.name.replace(/\.[^.]+$/, '') + '.cutout.png';
+    if (opts.bg) after.classList.remove('checker');
+    const name = f.name.replace(/\.[^.]+$/, '') + `.${opts.model}.cutout.png`;
     const btn = card.querySelector('.go');
     btn.disabled = false;
     btn.onclick = () => {
@@ -313,10 +387,11 @@ async function run(f) {
     card.querySelector('.t').textContent =
       ((performance.now() - t0) / 1000).toFixed(1) + ' s';
   } catch (err) {
-    after.innerHTML = '<div class="err">' + err.message + '</div>';
+    after.innerHTML = '<div class="err"></div>';
+    after.querySelector('.err').textContent = err.message;
     card.querySelector('.t').textContent = 'failed';
   } finally {
-    busy--; refreshStatus();
+    busy--; working[opts.model]--; refreshStatus();
   }
 }
 </script>
@@ -332,19 +407,26 @@ def index():
 
 @app.get("/api/status")
 def api_status():
-    info = loaded_info()
-    left = None
-    if info and STATE["idle"] > 0:
-        left = max(0, int(STATE["idle"] - (time.time() - STATE["last_used"])))
-    return {"loaded": info, "idle": STATE["idle"], "unload_in": left,
+    return {"loaded": loaded_models(), "idle": STATE["idle"],
             "ram_gb": round(rmbg.total_ram_gb())}
 
 
 @app.post("/api/unload")
-def api_unload():
+def api_unload(model: str = Form("")):
+    """Drop one model (form field `model`) or, without it, every model."""
     with GPU:
-        rmbg.unload_models()
-    return {"loaded": None}
+        if model:
+            rmbg.unload_model(model)
+        else:
+            rmbg.unload_models()
+    return {"loaded": loaded_models()}
+
+
+@app.post("/api/quit")
+def api_quit():
+    # exit a moment later so this response still reaches the browser
+    threading.Timer(0.3, lambda: os._exit(0)).start()
+    return {"quit": True}
 
 
 @app.post("/api/cutout")
@@ -356,19 +438,19 @@ def api_cutout(
 ):
     # sync endpoint on purpose: FastAPI runs it in a worker thread, so the
     # event loop keeps answering /api/status while the GPU is busy.
+    if model not in rmbg.MODELS:
+        return Response(f"unknown model {model!r}", status_code=400)
     raw = image.file.read()
     src = Image.open(io.BytesIO(raw)).convert("RGB")
 
     with GPU:
-        touch()
-        if rmbg._LOADED and model not in {k[0] for k in rmbg._LOADED}:
-            rmbg.unload_models()   # one model in memory at a time
+        touch(model)
         net, size, device, half = rmbg.load_model(
             model, rmbg.pick_device(STATE["device"]),
             half=False if STATE["fp32"] else None)
         size = STATE["size"] or size
         rgba, _ = rmbg.cutout(src, net, size, device, half=half, tta=bool(tta))
-        touch()
+        touch(model)
 
     if bg:
         out = rmbg.flatten(rgba, rmbg.parse_background(bg))
@@ -401,10 +483,9 @@ def main():
         print(f"warming up {rmbg.MODELS[args.model][0]} ...", flush=True)
         rmbg.load_model(args.model, rmbg.pick_device(args.device),
                         half=False if args.fp32 else None)
-        touch()
-    info = loaded_info()
-    if info:
-        print(f"{info['precision']} at {info['size']}px on {info['device']}, "
+        touch(args.model)
+    for m in loaded_models():
+        print(f"{m['model']}: {m['precision']} at {m['size']}px on {m['device']}, "
               f"{rmbg.total_ram_gb():.0f} GB RAM, idle unload after {args.idle}s")
     threading.Thread(target=idle_reaper, daemon=True).start()
     print(f"\n  open  http://{args.host}:{args.port}\n", flush=True)
