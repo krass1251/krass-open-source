@@ -45,6 +45,7 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from PIL import Image
 
 import rmbg
+import sam
 
 app = FastAPI(title="remove-bg (local)")
 
@@ -76,31 +77,46 @@ def touch(model):
 
 
 def loaded_names():
-    return {key[0] for key in list(rmbg._LOADED)}
+    names = {key[0] for key in list(rmbg._LOADED)}
+    if sam.loaded():
+        names.add(sam.NAME)
+    return names
 
 
 def idle_for(model):
     return time.time() - STATE["last_used"].get(model, 0)
 
 
+def unload_in(model):
+    if STATE["idle"] <= 0:
+        return None
+    return max(0, int(STATE["idle"] - idle_for(model)))
+
+
+def unload_one(model):
+    if model == sam.NAME:
+        sam.unload()
+    else:
+        rmbg.unload_model(model)
+
+
 def loaded_models():
     """What is in memory right now, for /api/status: one entry per model."""
     out = []
     for (model, device, half), (_, size, _, _) in list(rmbg._LOADED.items()):
-        left = None
-        if STATE["idle"] > 0:
-            left = max(0, int(STATE["idle"] - idle_for(model)))
         out.append({"model": model, "device": device,
                     "precision": "fp16" if half else "fp32",
-                    "size": STATE["size"] or size, "unload_in": left})
+                    "size": STATE["size"] or size, "unload_in": unload_in(model)})
+    if sam.loaded():
+        out.append({"model": sam.NAME, "device": "cpu", "precision": "fp32",
+                    "size": 1024, "unload_in": unload_in(sam.NAME)})
     return out
 
 
-def model_downloaded(name):
-    """(weights on disk?, MB in the hub cache) for one checkpoint."""
+def repo_downloaded(repo):
+    """(weights on disk?, MB in the hub cache) for one hugging face repo."""
     from huggingface_hub.constants import HF_HUB_CACHE
 
-    repo = rmbg.MODELS[name][0]
     d = os.path.join(HF_HUB_CACHE, "models--" + repo.replace("/", "--"))
     snaps = os.path.join(d, "snapshots")
     if not os.path.isdir(snaps):
@@ -125,7 +141,7 @@ def idle_reaper():
                 continue
             with GPU:
                 if model in loaded_names() and idle_for(model) >= STATE["idle"]:
-                    rmbg.unload_model(model)
+                    unload_one(model)
                     print(f"{model} unloaded after idle", flush=True)
 
 
@@ -188,6 +204,22 @@ def history_list():
             continue
     items.sort(key=lambda m: m["ts"])
     return items
+
+
+def parse_points(points):
+    """Form field -> [[x, y, label], ...] or raise HTTPException(400)."""
+    try:
+        pts = json.loads(points or "[]")
+        assert isinstance(pts, list)
+        out = []
+        for p in pts:
+            x, y, l = p
+            assert all(isinstance(v, (int, float)) and v == v for v in (x, y))
+            assert l in (0, 1)
+            out.append([float(x), float(y), int(l)])
+        return out
+    except (ValueError, TypeError, AssertionError):
+        raise HTTPException(400, "points must be [[x, y, 0|1], ...]")
 
 
 def history_purge():
@@ -324,6 +356,27 @@ PAGE = r"""<!doctype html>
   .chip .x:hover { background: var(--drop); color: var(--ink); }
   .chip .x[disabled] { opacity: .35; cursor: default; }
   .tag { color: var(--ink); font-weight: 600; }
+
+  /* click-to-select overlay */
+  #picker {
+    position: fixed; inset: 0; z-index: 10; background: rgba(12, 12, 14, .96);
+    display: flex; flex-direction: column; align-items: center; gap: 12px;
+    padding: 16px 24px; color: #eee;
+  }
+  #picker[hidden] { display: none; }
+  .pick-top {
+    width: 100%; max-width: 1200px; display: flex; gap: 18px; align-items: center;
+    justify-content: space-between; flex-wrap: wrap; font-size: 13px;
+  }
+  .pick-top .ghost { color: #eee; border-color: #555; }
+  .pick-top .ghost[aria-pressed=true] { background: #eee; color: #111; border-color: #eee; }
+  .pick-top .go { background: #4a8dff; color: #fff; padding: 6px 16px; }
+  .pick-tools { display: flex; gap: 8px; align-items: center; }
+  #picker-msg { font-weight: 600; min-width: 220px; }
+  .pick-stage { position: relative; line-height: 0; }
+  #picker-img { max-width: 94vw; max-height: calc(100vh - 130px); display: block; user-select: none; }
+  #picker-canvas { position: absolute; inset: 0; cursor: crosshair; }
+  .pick-hint { font-size: 12px; color: #999; }
 </style>
 </head>
 <body>
@@ -363,6 +416,24 @@ PAGE = r"""<!doctype html>
 
   <div class="cards" id="cards"></div>
 </main>
+
+<div id="picker" hidden>
+  <div class="pick-top">
+    <span id="picker-msg">Click the object you want to keep</span>
+    <span class="pick-tools">
+      <button class="ghost tool" data-label="1" aria-pressed="true">+ keep</button>
+      <button class="ghost tool" data-label="0" aria-pressed="false">− exclude</button>
+      <button class="ghost" id="picker-undo" disabled>Undo</button>
+      <button class="ghost" id="picker-reset" disabled>Reset</button>
+    </span>
+    <span class="pick-tools">
+      <button class="ghost" id="picker-cancel">Cancel</button>
+      <button class="go" id="picker-go" disabled>Cut out</button>
+    </span>
+  </div>
+  <div class="pick-stage"><img id="picker-img" draggable="false"><canvas id="picker-canvas"></canvas></div>
+  <div class="pick-hint">click = keep · ⌥-click or right-click = exclude · ⌘Z undo · Enter cuts out · Esc closes</div>
+</div>
 
 <script>
 const drop = document.getElementById('drop');
@@ -428,7 +499,8 @@ function optionsHtml(selected) {
 }
 async function loadModels() {
   const cur = modelSel.value;
-  MODELS = (await (await fetch('/api/models')).json()).models;
+  const info = await (await fetch('/api/models')).json();
+  MODELS = info.models; MODELS.sam = info.sam;
   MODELS.forEach(m => { LABEL[m.name] = m.label; });
   modelSel.innerHTML = optionsHtml(cur in LABEL ? cur : MODELS[0].name);
   showHint();
@@ -546,12 +618,14 @@ function cardEl(name, opts) {
       <button class="ghost copy" disabled title="copy the PNG to the clipboard">Copy</button>
       <select class="redo-model" title="model for Redo">${optionsHtml(opts.model)}</select>
       <button class="ghost redo" disabled>Redo with this model</button>
+      <button class="ghost pickobj" disabled title="click on the object to keep, for photos with several things in them">Pick object</button>
       <button class="ghost cancel">Cancel</button>
       <button class="ghost del" hidden>Delete</button>
     </div>
     <div class="meta">
       <span>${esc(name)} · <span class="tag">${esc(LABEL[opts.model] || opts.model)}</span>` +
-      `${opts.tta ? ' · extra pass' : ''}</span>
+      `${opts.tta ? ' · extra pass' : ''}` +
+      `${opts.points && opts.points.length ? ` · picked object (${opts.points.length} click${opts.points.length > 1 ? 's' : ''})` : ''}</span>
       <span class="t">working…</span>
     </div>`;
   return card;
@@ -604,6 +678,12 @@ function finish(card, src, opts, out) {
     redo.onclick = () => run(src.file ? src : { id: out.id, name: src.name },
       { ...opts, model: card.querySelector('.redo-model').value }, card);
   }
+  const pickBtn = card.querySelector('.pickobj');
+  if (out.id) {   // needs the stored original: the picker clicks on it
+    pickBtn.disabled = false;
+    pickBtn.onclick = () => openPicker({ id: out.id, name: src.name },
+      { ...opts, model: card.querySelector('.redo-model').value }, card);
+  }
   card.querySelector('.del').onclick = async () => {
     if (out.id) await fetch(`/api/history/${out.id}`, { method: 'DELETE' });
     card.remove();
@@ -633,6 +713,7 @@ async function run(src, opts, anchor) {
   body.append('model', opts.model);
   body.append('tta', opts.tta ? '1' : '');
   body.append('job', job);
+  if (opts.points && opts.points.length) body.append('points', JSON.stringify(opts.points));
 
   const t0 = performance.now();
   busy++; working[opts.model] = (working[opts.model] || 0) + 1; refreshStatus();
@@ -665,7 +746,7 @@ async function loadHistory() {
   let h;
   try { h = await (await fetch('/api/history')).json(); } catch (e) { return; }
   for (const it of h.items) {           // oldest first; prepend puts newest on top
-    const opts = { model: it.model, bg: it.bg, tta: it.tta };
+    const opts = { model: it.model, bg: it.bg, tta: it.tta, points: it.points || [] };
     const card = cardEl(it.name, opts);
     cards.prepend(card);
     card.querySelector('.shot img').src = `/api/history/${it.id}/orig`;
@@ -673,6 +754,118 @@ async function loadHistory() {
       { id: it.id, url: `/api/history/${it.id}/out`, seconds: it.seconds });
   }
 }
+
+// ---- click-to-select overlay (SAM 2). Clicks are in original image pixels;
+// the server returns a mask preview, Cut out runs BiRefNet on the picked
+// object as a new card above the one it came from.
+const pk = {
+  el: document.getElementById('picker'), img: document.getElementById('picker-img'),
+  canvas: document.getElementById('picker-canvas'), msg: document.getElementById('picker-msg'),
+  go: document.getElementById('picker-go'), undo: document.getElementById('picker-undo'),
+  reset: document.getElementById('picker-reset'),
+  src: null, opts: null, anchor: null, points: [], mask: null, label: 1, seq: 0,
+};
+
+function openPicker(src, opts, anchor) {
+  Object.assign(pk, { src, opts, anchor, points: [], mask: null, seq: pk.seq + 1 });
+  pk.img.src = `/api/history/${src.id}/orig`;
+  pk.el.hidden = false;
+  const sam = MODELS.sam || {};
+  pk.msg.textContent = 'Click the object you want to keep';
+  document.querySelector('.pick-hint').textContent = (sam.downloaded ? '' :
+    `first use downloads SAM 2 (~${sam.size_mb} MB) · `) +
+    'click = keep · ⌥-click or right-click = exclude · ⌘Z undo · Enter cuts out · Esc closes';
+  pickButtons();
+  if (opts.points && opts.points.length) {      // re-open a picked card: start from its clicks
+    pk.points = opts.points.map(p => [...p]);
+    pk.img.decode().then(() => { sizeCanvas(); refreshMask(); }).catch(() => {});
+  }
+}
+function closePicker() { pk.el.hidden = true; pk.img.src = ''; pk.mask = null; }
+function pickButtons() {
+  const n = pk.points.length;
+  pk.undo.disabled = pk.reset.disabled = n === 0;
+  pk.go.disabled = !(n && pk.mask);
+}
+function sizeCanvas() {
+  const r = pk.img.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  pk.canvas.width = Math.round(r.width * dpr); pk.canvas.height = Math.round(r.height * dpr);
+  pk.canvas.style.width = r.width + 'px'; pk.canvas.style.height = r.height + 'px';
+  drawPick();
+}
+function drawPick() {
+  const c = pk.canvas, ctx = c.getContext('2d');
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, c.width, c.height);
+  if (pk.mask) {
+    ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = 'rgba(0,0,0,.5)'; ctx.fillRect(0, 0, c.width, c.height);   // dim everything
+    ctx.globalCompositeOperation = 'destination-out';                          // ...but the object
+    ctx.drawImage(pk.mask, 0, 0, c.width, c.height);
+    ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = .28;      // and tint it
+    ctx.drawImage(pk.mask, 0, 0, c.width, c.height);
+    ctx.globalAlpha = 1;
+  }
+  const sx = c.width / pk.img.naturalWidth, sy = c.height / pk.img.naturalHeight;
+  const rad = 6 * (window.devicePixelRatio || 1);
+  for (const [x, y, l] of pk.points) {
+    ctx.beginPath(); ctx.arc(x * sx, y * sy, rad, 0, 7);
+    ctx.fillStyle = l ? '#3ddc84' : '#ff5252'; ctx.fill();
+    ctx.lineWidth = rad / 3; ctx.strokeStyle = '#fff'; ctx.stroke();
+  }
+}
+async function refreshMask() {
+  const seq = ++pk.seq;
+  if (!pk.points.length) { pk.mask = null; drawPick(); pickButtons(); pk.msg.textContent = 'Click the object you want to keep'; return; }
+  pk.msg.textContent = pk.mask ? 'Selecting…' : 'Reading the image…';
+  const body = new FormData();
+  body.append('source', pk.src.id); body.append('points', JSON.stringify(pk.points));
+  try {
+    await ensureAwake();
+    const res = await fetch('/api/sam', { method: 'POST', body });
+    if (!res.ok) throw new Error(await res.text());
+    const img = new Image();
+    img.src = URL.createObjectURL(await res.blob());
+    await img.decode();
+    if (seq !== pk.seq) return;                 // a newer click already answered
+    pk.mask = img;
+    pk.msg.textContent = 'Selected · click more to refine, ⌥-click to exclude';
+  } catch (e) {
+    if (seq !== pk.seq) return;
+    pk.msg.textContent = 'Failed: ' + e.message;
+  }
+  drawPick(); pickButtons();
+}
+function pickAt(e, label) {
+  const r = pk.canvas.getBoundingClientRect();
+  const x = Math.round((e.clientX - r.left) / r.width * pk.img.naturalWidth);
+  const y = Math.round((e.clientY - r.top) / r.height * pk.img.naturalHeight);
+  pk.points.push([x, y, label]);
+  drawPick(); pickButtons(); refreshMask();
+}
+pk.canvas.addEventListener('click', e => pickAt(e, e.altKey ? 0 : pk.label));
+pk.canvas.addEventListener('contextmenu', e => { e.preventDefault(); pickAt(e, 0); });
+document.querySelectorAll('#picker .tool').forEach(b => b.addEventListener('click', () => {
+  pk.label = +b.dataset.label;
+  document.querySelectorAll('#picker .tool').forEach(t => t.setAttribute('aria-pressed', t === b));
+}));
+pk.undo.addEventListener('click', () => { pk.points.pop(); refreshMask(); });
+pk.reset.addEventListener('click', () => { pk.points = []; refreshMask(); });
+document.getElementById('picker-cancel').addEventListener('click', closePicker);
+pk.go.addEventListener('click', () => {
+  const { src, opts, anchor, points } = pk;
+  closePicker();
+  run(src, { ...opts, points: points.map(p => [...p]) }, anchor);
+});
+pk.img.addEventListener('load', sizeCanvas);
+window.addEventListener('resize', () => { if (!pk.el.hidden) sizeCanvas(); });
+window.addEventListener('keydown', e => {
+  if (pk.el.hidden) return;
+  if (e.key === 'Escape') closePicker();
+  else if (e.key === 'Enter' && !pk.go.disabled) pk.go.click();
+  else if (e.key === 'z' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); pk.undo.click(); }
+});
 
 (async () => {
   await loadModels();
@@ -702,11 +895,13 @@ def api_status():
 def api_models():
     out = []
     for name, (label, hint, mb) in MODEL_INFO.items():
-        have, size = model_downloaded(name)
+        have, size = repo_downloaded(rmbg.MODELS[name][0])
         out.append({"name": name, "label": label, "hint": hint,
                     "native": rmbg.MODELS[name][1],
                     "downloaded": have, "size_mb": size if have else mb})
-    return {"models": out}
+    have, size = repo_downloaded(sam.MODEL_ID)
+    return {"models": out,
+            "sam": {"downloaded": have, "size_mb": size if have else 180}}
 
 
 @app.post("/api/unload")
@@ -714,10 +909,30 @@ def api_unload(model: str = Form("")):
     """Drop one model (form field `model`) or, without it, every model."""
     with GPU:
         if model:
-            rmbg.unload_model(model)
+            unload_one(model)
         else:
             rmbg.unload_models()
+            sam.unload()
     return {"loaded": loaded_models()}
+
+
+@app.post("/api/sam")
+def api_sam(source: str = Form(""), points: str = Form("")):
+    """Mask preview for the click-to-select overlay: the stored original
+    under history id `source`, clicks as JSON [[x, y, label], ...] in image
+    pixels. Returns a downscaled RGBA PNG, blue with the mask as alpha.
+    CPU only, so it does not queue behind the GPU."""
+    pts = parse_points(points)
+    if not pts:
+        return Response("no points", status_code=400)
+    meta = history_meta(source)
+    image = Image.open(os.path.join(history_dir(source), "orig" + meta["ext"])).convert("RGB")
+    touch(sam.NAME)
+    logits = sam.segment(image, pts, key=source)
+    touch(sam.NAME)
+    buf = io.BytesIO()
+    sam.preview_png(logits).save(buf, format="PNG")
+    return Response(buf.getvalue(), media_type="image/png")
 
 
 @app.post("/api/wake")
@@ -779,6 +994,7 @@ def api_cutout(
     model: str = Form("hr-matting"),
     tta: str = Form(""),
     job: str = Form(""),           # client id, so /api/cancel can skip it
+    points: str = Form(""),        # JSON [[x, y, label], ...]: keep only the clicked object
 ):
     # sync endpoint on purpose: FastAPI runs it in a worker thread, so the
     # event loop keeps answering /api/status while the GPU is busy.
@@ -794,6 +1010,7 @@ def api_cutout(
     else:
         return Response("no image", status_code=400)
     src = Image.open(io.BytesIO(raw)).convert("RGB")
+    pts = parse_points(points)
 
     t0 = time.time()
     with GPU:
@@ -804,7 +1021,16 @@ def api_cutout(
             model, rmbg.pick_device(STATE["device"]),
             half=False if STATE["fp32"] else None)
         size = STATE["size"] or size
-        rgba, _ = rmbg.cutout(src, net, size, device, half=half, tta=bool(tta))
+        if pts:
+            touch(sam.NAME)
+            try:
+                rgba, _ = sam.cutout_picked(src, pts, net, size, device, half=half,
+                                            tta=bool(tta), key=source or None)
+            except ValueError as e:
+                return Response(str(e), status_code=422)
+            touch(sam.NAME)
+        else:
+            rgba, _ = rmbg.cutout(src, net, size, device, half=half, tta=bool(tta))
         touch(model)
 
     if bg:
@@ -818,7 +1044,7 @@ def api_cutout(
     headers = {"X-Seconds": f"{time.time() - t0:.2f}"}
     if STATE["history_days"] > 0 and job not in CANCELLED:
         headers["X-Id"] = history_save(raw, name, png, {
-            "model": model, "bg": bg, "tta": bool(tta),
+            "model": model, "bg": bg, "tta": bool(tta), "points": pts,
             "seconds": round(time.time() - t0, 2),
             "width": src.width, "height": src.height})
     return Response(png, media_type="image/png", headers=headers)

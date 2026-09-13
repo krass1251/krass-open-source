@@ -50,6 +50,24 @@ Model, background and extra pass are remembered between visits. The line
 under the toolbar says what the selected model is good for and whether its
 weights are on disk yet (each is a ~430 MB download on first use, lite 170).
 
+### Pick object: click on what to keep
+
+BiRefNet decides by itself what the subject is, which is right most of the
+time. When a photo has several things in it, **Pick object** on a card opens
+the photo large: click the object to keep, ⌥-click (or right-click) parts to
+drop, the selection shows at once; **Cut out** makes a new card with only
+that object. Clicks are remembered with the result, so Redo with another
+model keeps the same object and Pick object on that card starts from them.
+
+Under the hood this is [SAM 2](https://github.com/facebookresearch/sam2)
+(`sam2.1-hiera-small`, 39M parameters, Apache-2.0, ~180 MB download on first
+use) picking the object and BiRefNet doing the edges: the object is cropped
+out with a margin, BiRefNet runs on the crop, and its alpha is kept inside
+the SAM region. If BiRefNet does not see the object at all, the SAM mask is
+used as is (coarser edges, but the right object). SAM runs on the CPU, ~1 s
+to read an image once and ~30 ms per click after that, and shows up in the
+memory line as `sam2` with the same idle unload as the other models.
+
 ### History
 
 Every result is kept for 7 days in
