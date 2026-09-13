@@ -20,10 +20,16 @@ History: each result (original + cutout + settings) is kept under
 reload or a server restart, and Redo can rerun an old photo with another
 model. Delete on a card removes it from disk at once.
 
+Edit on a card opens a full-screen editor over the stored original and
+cutout: SAM 2 clicks to select an object, a brush to restore or erase by
+hand, and Generate to rerun the model with the clicks (a draft, so tries
+never become cards). Done posts the composed pixels to /api/edit, which
+stores them as one new card next to the one they came from.
+
 Sleep: after --sleep-after minutes without an image (default 10, 0 = never)
 the process exec()s into sleeper.py on the same port: the idle torch runtime
 alone is ~1 GB, the sleeper ~15 MB. Any request except status polling counts
-as work (a reload, the picker, the brush), and the swap waits for requests in
+as work (a reload, the editor), and the swap waits for requests in
 flight, so an open tab can stay open forever and never loses a request.
 
 Only the page on this machine may talk to the API: Host must be loopback and
@@ -270,7 +276,7 @@ def png_bytes(image):
 def history_save(raw, name, png, meta, cut=None):
     """Write original + result + meta; meta.json goes last so a half-written
     entry is invisible to history_list(). `cut` is the transparent RGBA
-    cutout when `png` was flattened onto a background: the brush needs it."""
+    cutout when `png` was flattened onto a background: the editor needs it."""
     hid = uuid.uuid4().hex
     d = os.path.join(HISTORY_DIR, hid)
     os.makedirs(d)
@@ -483,26 +489,6 @@ PAGE = r"""<!doctype html>
   .chip .x[disabled] { opacity: .35; cursor: default; }
   .tag { color: var(--ink); font-weight: 600; }
 
-  /* click-to-select overlay */
-  #picker {
-    position: fixed; inset: 0; z-index: 10; background: rgba(12, 12, 14, .96);
-    display: flex; flex-direction: column; align-items: center; gap: 12px;
-    padding: 16px 24px; color: #eee;
-  }
-  #picker[hidden] { display: none; }
-  .pick-top {
-    width: 100%; max-width: 1200px; display: flex; gap: 18px; align-items: center;
-    justify-content: space-between; flex-wrap: wrap; font-size: 13px;
-  }
-  .pick-top .ghost { color: #eee; border-color: #555; }
-  .pick-top .ghost[aria-pressed=true] { background: #eee; color: #111; border-color: #eee; }
-  .pick-top .go { background: #4a8dff; color: #fff; padding: 6px 16px; }
-  .pick-tools { display: flex; gap: 8px; align-items: center; }
-  #picker-msg { font-weight: 600; min-width: 220px; }
-  .pick-stage { position: relative; line-height: 0; }
-  #picker-img { max-width: 94vw; max-height: calc(100vh - 130px); display: block; user-select: none; }
-  #picker-canvas { position: absolute; inset: 0; cursor: crosshair; }
-  .pick-hint { font-size: 12px; color: #999; }
   .ovl-close {
     width: 34px; height: 34px; padding: 0; margin-left: 6px; border-radius: 50%;
     border: 1px solid #555; background: transparent; color: #eee;
@@ -510,27 +496,63 @@ PAGE = r"""<!doctype html>
   }
   .ovl-close:hover { background: #333; border-color: #888; }
 
-  /* brush overlay: same frame as the picker, scrollable zoomable stage */
-  #brush {
-    position: fixed; inset: 0; z-index: 10; background: rgba(12, 12, 14, .96);
-    display: flex; flex-direction: column; align-items: center; gap: 12px;
-    padding: 16px 24px; color: #eee;
+  /* editor overlay: tools in a left panel, one big stage for the image */
+  #editor {
+    position: fixed; inset: 0; z-index: 10; background: rgba(12, 12, 14, .97);
+    color: #eee; padding: 14px 18px; gap: 12px 16px;
+    display: grid; grid-template-columns: 236px 1fr; grid-template-rows: auto 1fr auto;
   }
-  #brush[hidden] { display: none; }
-  #brush label { display: inline-flex; gap: 6px; align-items: center; font-size: 12px; color: #bbb; }
-  #brush input[type=range] { width: 90px; }
-  .br-wrap { position: relative; line-height: 0; }
-  .br-stage { overflow: auto; max-width: 94vw; max-height: calc(100vh - 130px); }
-  #br-work {
-    display: block; cursor: none;
+  #editor[hidden] { display: none; }
+  #editor > * { min-width: 0; min-height: 0; }   /* or the stage grows instead of scrolling */
+  #editor .ghost { color: #eee; border-color: #555; }
+  #editor .ghost[aria-pressed=true] { background: #eee; color: #111; border-color: #eee; }
+  #editor .go { background: #4a8dff; color: #fff; padding: 6px 16px; }
+  #editor select {
+    width: 100%; font-size: 12px; color: #eee; background: #2a2a30; border-color: #555;
+  }
+  #editor label { display: flex; gap: 6px; align-items: center; font-size: 12px; color: #bbb; }
+  #editor input[type=range] { width: 100px; }
+  .ed-top {
+    grid-column: 1 / -1; display: flex; gap: 18px; align-items: center;
+    justify-content: space-between; font-size: 13px;
+  }
+  #ed-msg { font-weight: 600; }
+  .ed-panel { overflow: auto; display: flex; flex-direction: column; gap: 14px; }
+  .ed-sec { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .ed-sec[hidden] { display: none; }
+  .ed-sec h3 {
+    width: 100%; margin: 0; font: 600 10px/1.4 inherit; letter-spacing: .09em;
+    text-transform: uppercase; color: #888;
+  }
+  .ed-stage-box { position: relative; }
+  .ed-stage { position: absolute; inset: 0; overflow: auto; background: #0d0d0f; border-radius: 10px; }
+  .ed-wrap { position: relative; margin: auto; cursor: crosshair; }
+  #editor.brush .ed-wrap { cursor: none; }
+  .ed-wrap canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  .ed-wrap canvas[hidden] { display: none; }
+  .checkers {
     background-image:
       linear-gradient(45deg, #444 25%, transparent 25%, transparent 75%, #444 75%),
       linear-gradient(45deg, #444 25%, #666 25%, #666 75%, #444 75%);
     background-size: 20px 20px; background-position: 0 0, 10px 10px;
   }
-  #br-work.white { background: #fff; }
-  #br-work.black { background: #000; }
-  #br-ring { position: absolute; inset: 0; pointer-events: none; }
+  #ed-work.white { background: #fff; }
+  #ed-work.black { background: #000; }
+  #ed-handle {
+    position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px;
+    background: #fff; cursor: ew-resize; touch-action: none;
+  }
+  #ed-handle[hidden] { display: none; }
+  #ed-handle::after {
+    content: '↔'; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    width: 30px; height: 30px; border-radius: 50%; background: #fff; color: #111;
+    font-size: 16px; line-height: 30px; text-align: center;
+  }
+  #ed-ring { position: absolute; inset: 0; pointer-events: none; }
+  #ed-versions { display: flex; flex-direction: column; gap: 6px; width: 100%; }
+  .ed-ver { display: flex; gap: 8px; align-items: center; width: 100%; text-align: left; }
+  .ed-ver canvas { width: 34px; height: 34px; border-radius: 4px; flex: none; background-size: 10px 10px; }
+  .ed-hint { grid-column: 1 / -1; font-size: 12px; color: #999; }
 </style>
 </head>
 <body>
@@ -577,52 +599,76 @@ PAGE = r"""<!doctype html>
 
 <div id="toast" hidden><span>Deleted</span><button class="ghost" id="undo-del">Undo</button></div>
 
-<div id="picker" hidden>
-  <div class="pick-top">
-    <span id="picker-msg">Click the object you want to keep</span>
-    <span class="pick-tools">
-      <button class="ghost tool" data-label="1" aria-pressed="true">+ keep</button>
-      <button class="ghost tool" data-label="0" aria-pressed="false">− exclude</button>
-      <button class="ghost" id="picker-undo" disabled>Undo</button>
-      <button class="ghost" id="picker-reset" disabled>Reset</button>
-    </span>
-    <span class="pick-tools">
-      <button class="go" id="picker-go" disabled>Redo with selection</button>
-      <button class="ovl-close" id="picker-close" title="close without applying (Esc)">×</button>
+<div id="editor" hidden>
+  <div class="ed-top">
+    <span id="ed-msg" class="t">Loading…</span>
+    <span class="ed-sec">
+      <button class="go" id="ed-done" disabled title="save the result as a new card (Enter)">Done</button>
+      <button class="ovl-close" id="ed-close" title="close without saving (Esc)">×</button>
     </span>
   </div>
-  <div class="pick-stage"><img id="picker-img" draggable="false"><canvas id="picker-canvas"></canvas></div>
-  <div class="pick-hint">click = keep · ⌥-click or right-click = exclude · ⌘Z undo · Enter applies · Esc closes</div>
-</div>
-
-<div id="brush" hidden>
-  <div class="pick-top">
-    <span id="br-msg">Paint over what to bring back or erase</span>
-    <span class="pick-tools">
-      <button class="ghost br-tool" data-mode="restore" aria-pressed="true" title="paint the original back (R)">Restore</button>
-      <button class="ghost br-tool" data-mode="erase" aria-pressed="false" title="make transparent (E)">Erase</button>
-      <label>size <input type="range" id="br-size" min="2" max="400" value="40"></label>
-      <label>soft <input type="range" id="br-soft" min="0" max="100" value="50"></label>
-      <button class="ghost" id="br-undo" disabled>Undo</button>
-      <button class="ghost" id="br-redo" disabled>Redo</button>
-      <button class="ghost" id="br-reset" disabled>Reset</button>
-    </span>
-    <span class="pick-tools">
-      <button class="ghost br-view" data-view="" aria-pressed="true" title="view on checkerboard">▦</button>
-      <button class="ghost br-view" data-view="white" aria-pressed="false" title="view on white">white</button>
-      <button class="ghost br-view" data-view="black" aria-pressed="false" title="view on black">black</button>
-      <button class="ghost" id="br-zoomout" title="zoom out">−</button>
-      <button class="ghost" id="br-zoomfit" title="fit to screen">fit</button>
-      <button class="ghost" id="br-zoomin" title="zoom in">+</button>
-      <button class="go" id="br-go" disabled>Apply changes</button>
-      <button class="ovl-close" id="br-close" title="close without applying (Esc)">×</button>
-    </span>
+  <div class="ed-panel">
+    <div class="ed-sec">
+      <h3>Tool</h3>
+      <button class="ghost ed-tool" data-tool="pick" aria-pressed="true" title="click the object to keep (P)">Pick</button>
+      <button class="ghost ed-tool" data-tool="brush" aria-pressed="false" title="paint by hand (B)">Brush</button>
+    </div>
+    <div class="ed-sec" id="ed-pick">
+      <h3>Selection</h3>
+      <button class="ghost ed-label" data-label="1" aria-pressed="true">+ keep</button>
+      <button class="ghost ed-label" data-label="0" aria-pressed="false">− exclude</button>
+      <button class="ghost" id="ed-sel-erase" disabled title="make the selected region transparent, no model run">Erase selection</button>
+      <button class="ghost" id="ed-sel-restore" disabled title="paint the original back inside the selection">Restore selection</button>
+      <button class="ghost" id="ed-clear" disabled>Clear clicks</button>
+    </div>
+    <div class="ed-sec" id="ed-brush" hidden>
+      <h3>Brush</h3>
+      <button class="ghost ed-mode" data-mode="restore" aria-pressed="true" title="paint the original back (R)">Restore</button>
+      <button class="ghost ed-mode" data-mode="erase" aria-pressed="false" title="make transparent (E)">Erase</button>
+      <label>size <input type="range" id="ed-size" min="2" max="400" value="40"></label>
+      <label>soft <input type="range" id="ed-soft" min="0" max="100" value="50"></label>
+    </div>
+    <div class="ed-sec">
+      <h3>View</h3>
+      <button class="ghost ed-view" data-view="orig" aria-pressed="false" title="the original (1)">Original</button>
+      <button class="ghost ed-view" data-view="result" aria-pressed="true" title="the cutout (2)">Result</button>
+      <button class="ghost ed-view" data-view="compare" aria-pressed="false" title="drag the slider (3)">Compare</button>
+      <button class="ghost ed-bd" data-bd="" aria-pressed="true" title="on a checkerboard">▦</button>
+      <button class="ghost ed-bd" data-bd="white" aria-pressed="false" title="on white">white</button>
+      <button class="ghost ed-bd" data-bd="black" aria-pressed="false" title="on black">black</button>
+      <button class="ghost" id="ed-zoomout" title="zoom out">−</button>
+      <button class="ghost" id="ed-zoomfit" title="fit to the stage">fit</button>
+      <button class="ghost" id="ed-zoomin" title="zoom in">+</button>
+    </div>
+    <div class="ed-sec">
+      <h3>Generate</h3>
+      <select id="ed-model" title="model for Generate"></select>
+      <label><input type="checkbox" id="ed-tta"> extra pass</label>
+      <button class="go" id="ed-gen" title="rerun the model with these clicks">Generate</button>
+    </div>
+    <div class="ed-sec">
+      <h3>History</h3>
+      <button class="ghost" id="ed-undo" disabled>Undo</button>
+      <button class="ghost" id="ed-redo" disabled>Redo</button>
+      <button class="ghost" id="ed-reset" disabled>Reset</button>
+    </div>
+    <div class="ed-sec">
+      <h3>Versions</h3>
+      <div id="ed-versions"></div>
+    </div>
   </div>
-  <div class="br-wrap">
-    <div class="br-stage" id="br-stage"><canvas id="br-work"></canvas></div>
-    <canvas id="br-ring"></canvas>
+  <div class="ed-stage-box">
+    <div class="ed-stage" id="ed-stage">
+      <div class="ed-wrap" id="ed-wrap">
+        <canvas id="ed-orig" hidden></canvas>
+        <canvas id="ed-work" class="checkers"></canvas>
+        <canvas id="ed-mask"></canvas>
+        <div id="ed-handle" hidden></div>
+      </div>
+    </div>
+    <canvas id="ed-ring"></canvas>
   </div>
-  <div class="pick-hint">drag to paint · [ ] brush size · X swaps Restore/Erase · ⌘Z undo, ⌘⇧Z redo · Enter applies · Esc closes</div>
+  <div class="ed-hint" id="ed-hint"></div>
 </div>
 
 <script>
@@ -727,7 +773,7 @@ function handle(files) {
 // ---- memory status. After 10 min without work the server swaps itself for
 // a tiny sleeper on the same port; dropping a photo (or Wake up) brings it back.
 const wake = document.getElementById('wake');
-const JOBS = {};   // job id -> card, so the server's stage lands on the right card
+const JOBS = {};   // job id -> status element, so the server's stage lands on the right line
 const STAGE = {
   queued: 'waiting for the GPU…', download: 'downloading the model, first use (a few minutes)…',
   load: 'loading the model…', sam: 'loading SAM 2…', run: 'processing…',
@@ -737,8 +783,8 @@ async function refreshStatus() {
   try { s = await (await fetch('/api/status')).json(); }
   catch (e) { stat.textContent = 'server not reachable'; return; }
   for (const [job, stage] of Object.entries(s.jobs || {})) {
-    const c = JOBS[job];
-    if (c) c.querySelector('.t').textContent = STAGE[stage] || stage;
+    const t = JOBS[job];
+    if (t) t.textContent = STAGE[stage] || stage;
   }
   wake.hidden = !s.sleeping;
   if (s.sleeping) {
@@ -816,7 +862,7 @@ function cardEl(name, opts) {
       <span>${esc(name)} · <span class="tag">${esc(LABEL[opts.model] || opts.model)}</span>` +
       `${opts.tta ? ' · extra pass' : ''}` +
       `${opts.points && opts.points.length ? ` · picked object (${opts.points.length} click${opts.points.length > 1 ? 's' : ''})` : ''}` +
-      `${opts.edited ? ' · brush' : ''}</span>
+      `${opts.edited ? ' · edited' : ''}</span>
       <span class="t">working…</span>
     </div>
     <button class="corner del" hidden title="delete this result">×</button>
@@ -828,8 +874,7 @@ function cardEl(name, opts) {
         <button class="ghost redo" disabled title="run this photo again with the model on the left">Redo</button>
       </div>
       <div class="grp">
-        <button class="ghost pickobj" disabled title="click on the object to keep, for photos with several things in them">Pick object</button>
-        <button class="ghost touchup" disabled title="brush: bring parts back or erase them by hand">Touch up</button>
+        <button class="ghost edit" disabled title="pick the object, brush it by hand, rerun the model">Edit</button>
       </div>
       <div class="grp end">
         <button class="ghost cancel">Cancel</button>
@@ -887,14 +932,11 @@ function finish(card, src, opts, out) {
     redo.onclick = () => run(src.file ? src : { id: out.id, name: src.name },
       { ...opts, model: card.querySelector('.redo-model').value }, card);
   }
-  const pickBtn = card.querySelector('.pickobj');
-  if (out.id) {   // needs the stored original: the picker clicks on it
-    pickBtn.disabled = false;
-    pickBtn.onclick = () => openPicker({ id: out.id, name: src.name },
-      { ...opts, model: card.querySelector('.redo-model').value }, card);
-    const tu = card.querySelector('.touchup');
-    tu.disabled = false;
-    tu.onclick = () => openBrush({ id: out.id, name: src.name }, opts, card);
+  const editBtn = card.querySelector('.edit');
+  if (out.id) {   // needs the stored original and cutout: the editor works on both
+    editBtn.disabled = false;
+    editBtn.onclick = () => openEditor({ id: out.id, name: src.name }, opts, card,
+      card.querySelector('.redo-model').value);
   }
   card.querySelector('.del').onclick = () => softDelete([card]);
 }
@@ -942,8 +984,8 @@ function updateHead() {
 }
 new MutationObserver(updateHead).observe(cards, { childList: true });
 
-// extra = {url, blob, strokes}: post a brush-edited PNG to /api/edit instead
-// of running the model; the card flow is the same. Resolves true on success.
+// extra = {url, blob, strokes}: post an edited PNG to /api/edit instead of
+// running the model; the card flow is the same. Resolves true on success.
 async function run(src, opts, anchor, extra) {
   const card = cardEl(src.name, opts);
   if (anchor) anchor.before(card); else cards.prepend(card);
@@ -967,12 +1009,15 @@ async function run(src, opts, anchor, extra) {
   body.append('model', opts.model);
   body.append('tta', opts.tta ? '1' : '');
   body.append('job', job);
-  if (opts.points && opts.points.length) body.append('points', JSON.stringify(opts.points));
+  // an edit always states its clicks, "[]" included: the new card records what
+  // really produced those pixels instead of copying the source's meta
+  if (extra && extra.url) body.append('points', JSON.stringify(opts.points || []));
+  else if (opts.points && opts.points.length) body.append('points', JSON.stringify(opts.points));
   if (extra && extra.blob) { body.append('image', extra.blob, 'edit.png'); body.append('strokes', extra.strokes); }
 
   const t0 = performance.now();
   const tEl = card.querySelector('.t');
-  busy++; working[opts.model] = (working[opts.model] || 0) + 1; JOBS[job] = card; refreshStatus();
+  busy++; working[opts.model] = (working[opts.model] || 0) + 1; JOBS[job] = tEl; refreshStatus();
   try {
     tEl.textContent = 'starting…';
     await ensureAwake();
@@ -1015,197 +1060,200 @@ async function loadHistory() {
   }
 }
 
-// ---- click-to-select overlay (SAM 2). Clicks are in original image pixels;
-// the server returns a mask preview, Redo with selection runs BiRefNet on the picked
-// object as a new card above the one it came from.
-const pk = {
-  el: document.getElementById('picker'), img: document.getElementById('picker-img'),
-  canvas: document.getElementById('picker-canvas'), msg: document.getElementById('picker-msg'),
-  go: document.getElementById('picker-go'), undo: document.getElementById('picker-undo'),
-  reset: document.getElementById('picker-reset'),
-  src: null, opts: null, anchor: null, points: [], mask: null, label: 1, seq: 0,
-};
-
-async function openPicker(src, opts, anchor) {
-  Object.assign(pk, { src, opts, anchor, points: [], mask: null, seq: pk.seq + 1 });
-  pk.el.hidden = false;
-  pk.msg.textContent = 'Loading…';
-  try { await ensureAwake(); }      // asleep, the sleeper would serve a 503 instead of the photo
-  catch (e) { pk.msg.textContent = 'Failed: ' + e.message; return; }
-  if (pk.el.hidden) return;         // closed while waking
-  pk.img.src = `/api/history/${src.id}/orig`;
-  const sam = MODELS.sam || {};
-  pk.msg.textContent = 'Click the object you want to keep';
-  document.querySelector('.pick-hint').textContent = (sam.downloaded ? '' :
-    `first use downloads SAM 2 (~${sam.size_mb} MB) · `) +
-    'click = keep · ⌥-click or right-click = exclude · ⌘Z undo · Enter applies · Esc closes';
-  pickButtons();
-  if (opts.points && opts.points.length) {      // re-open a picked card: start from its clicks
-    pk.points = opts.points.map(p => [...p]);
-    pk.img.decode().then(() => { sizeCanvas(); refreshMask(); }).catch(() => {});
-  }
-}
-function closePicker() { pk.el.hidden = true; pk.img.src = ''; pk.mask = null; }
-function pickButtons() {
-  const n = pk.points.length;
-  pk.undo.disabled = pk.reset.disabled = n === 0;
-  pk.go.disabled = !(n && pk.mask);
-}
-function sizeCanvas() {
-  const r = pk.img.getBoundingClientRect();
-  const dpr = window.devicePixelRatio || 1;
-  pk.canvas.width = Math.round(r.width * dpr); pk.canvas.height = Math.round(r.height * dpr);
-  pk.canvas.style.width = r.width + 'px'; pk.canvas.style.height = r.height + 'px';
-  drawPick();
-}
-function drawPick() {
-  const c = pk.canvas, ctx = c.getContext('2d');
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.clearRect(0, 0, c.width, c.height);
-  if (pk.mask) {
-    // kept = full brightness with a green outline, removed = dimmed hard
-    ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
-    ctx.fillStyle = 'rgba(0,0,0,.72)'; ctx.fillRect(0, 0, c.width, c.height);
-    ctx.globalCompositeOperation = 'destination-out';
-    ctx.drawImage(pk.mask, 0, 0, c.width, c.height);
-    // outline: the mask in green, grown by d px, minus the mask itself
-    const d = Math.max(2, Math.round(c.width / 500));
-    const shape = document.createElement('canvas'); shape.width = c.width; shape.height = c.height;
-    const sc = shape.getContext('2d');
-    sc.drawImage(pk.mask, 0, 0, c.width, c.height);
-    sc.globalCompositeOperation = 'source-in'; sc.fillStyle = '#3ddc84'; sc.fillRect(0, 0, c.width, c.height);
-    const ring = document.createElement('canvas'); ring.width = c.width; ring.height = c.height;
-    const rc = ring.getContext('2d');
-    for (const [dx, dy] of [[d, 0], [-d, 0], [0, d], [0, -d], [d, d], [-d, -d], [d, -d], [-d, d]])
-      rc.drawImage(shape, dx, dy);
-    rc.globalCompositeOperation = 'destination-out'; rc.drawImage(shape, 0, 0);
-    ctx.globalCompositeOperation = 'source-over';
-    ctx.drawImage(ring, 0, 0);
-  }
-  const sx = c.width / pk.img.naturalWidth, sy = c.height / pk.img.naturalHeight;
-  const rad = 6 * (window.devicePixelRatio || 1);
-  for (const [x, y, l] of pk.points) {
-    ctx.beginPath(); ctx.arc(x * sx, y * sy, rad, 0, 7);
-    ctx.fillStyle = l ? '#3ddc84' : '#ff5252'; ctx.fill();
-    ctx.lineWidth = rad / 3; ctx.strokeStyle = '#fff'; ctx.stroke();
-  }
-}
-async function refreshMask() {
-  const seq = ++pk.seq;
-  if (!pk.points.length) { pk.mask = null; drawPick(); pickButtons(); pk.msg.textContent = 'Click the object you want to keep'; return; }
-  pk.msg.textContent = pk.mask ? 'Selecting…' : 'Reading the image…';
-  const body = new FormData();
-  body.append('source', pk.src.id); body.append('points', JSON.stringify(pk.points));
-  try {
-    await ensureAwake();
-    const res = await fetch('/api/sam', { method: 'POST', body });
-    if (!res.ok) throw new Error(await res.text());
-    const img = new Image();
-    img.src = URL.createObjectURL(await res.blob());
-    await img.decode();
-    if (seq !== pk.seq) return;                 // a newer click already answered
-    pk.mask = img;
-    pk.msg.textContent = 'Bright with green outline = kept, dark = removed · click to add, ⌥-click to exclude';
-  } catch (e) {
-    if (seq !== pk.seq) return;
-    pk.msg.textContent = 'Failed: ' + e.message;
-  }
-  drawPick(); pickButtons();
-}
-function pickAt(e, label) {
-  const r = pk.canvas.getBoundingClientRect();
-  const x = Math.round((e.clientX - r.left) / r.width * pk.img.naturalWidth);
-  const y = Math.round((e.clientY - r.top) / r.height * pk.img.naturalHeight);
-  pk.points.push([x, y, label]);
-  drawPick(); pickButtons(); refreshMask();
-}
-pk.canvas.addEventListener('click', e => pickAt(e, e.altKey ? 0 : pk.label));
-pk.canvas.addEventListener('contextmenu', e => { e.preventDefault(); pickAt(e, 0); });
-document.querySelectorAll('#picker .tool').forEach(b => b.addEventListener('click', () => {
-  pk.label = +b.dataset.label;
-  document.querySelectorAll('#picker .tool').forEach(t => t.setAttribute('aria-pressed', t === b));
-}));
-pk.undo.addEventListener('click', () => { pk.points.pop(); refreshMask(); });
-pk.reset.addEventListener('click', () => { pk.points = []; refreshMask(); });
-document.getElementById('picker-close').addEventListener('click', closePicker);
-pk.go.addEventListener('click', () => {
-  const { src, opts, anchor, points } = pk;
-  closePicker();
-  run(src, { ...opts, points: points.map(p => [...p]) }, anchor);
-});
-pk.img.addEventListener('load', sizeCanvas);
-window.addEventListener('resize', () => { if (!pk.el.hidden) sizeCanvas(); });
-window.addEventListener('keydown', e => {
-  if (pk.el.hidden) return;
-  if (e.key === 'Escape') closePicker();
-  else if (e.key === 'Enter' && !pk.go.disabled) pk.go.click();
-  else if (e.key.toLowerCase() === 'z' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); pk.undo.click(); }
-});
-
-// ---- brush overlay. Works on the full-resolution cutout in a canvas:
-// Restore stamps the original's pixels back through a soft circle, Erase
-// cuts alpha with destination-out. Strokes are kept as data and replayed
-// from the untouched cutout for Undo, so no pixel snapshots pile up.
-const br = {
-  el: document.getElementById('brush'), stage: document.getElementById('br-stage'),
-  work: document.getElementById('br-work'), ring: document.getElementById('br-ring'),
-  msg: document.getElementById('br-msg'), go: document.getElementById('br-go'),
-  undo: document.getElementById('br-undo'), redo: document.getElementById('br-redo'),
-  reset: document.getElementById('br-reset'), sizeEl: document.getElementById('br-size'),
-  softEl: document.getElementById('br-soft'),
-  src: null, opts: null, anchor: null, base: null, orig: null,
-  strokes: [], undone: [], cur: null, mode: 'restore', zoom: 1, fit: 1,
-  tmp: document.createElement('canvas'), mouse: null,
+// ---- editor overlay. One workspace per card: Pick (SAM 2 clicks, in
+// original image pixels) and Brush share one undo stack, Generate reruns the
+// model as a draft version without touching the card list, Done posts the
+// composed pixels to /api/edit as a new card above the one it came from.
+const ed = {
+  el: document.getElementById('editor'), stage: document.getElementById('ed-stage'),
+  wrap: document.getElementById('ed-wrap'), msg: document.getElementById('ed-msg'),
+  orig: document.getElementById('ed-orig'), work: document.getElementById('ed-work'),
+  maskC: document.getElementById('ed-mask'), ring: document.getElementById('ed-ring'),
+  handle: document.getElementById('ed-handle'), hint: document.getElementById('ed-hint'),
+  done: document.getElementById('ed-done'), gen: document.getElementById('ed-gen'),
+  undoB: document.getElementById('ed-undo'), redoB: document.getElementById('ed-redo'),
+  resetB: document.getElementById('ed-reset'), clearB: document.getElementById('ed-clear'),
+  selErase: document.getElementById('ed-sel-erase'),
+  selRestore: document.getElementById('ed-sel-restore'),
+  modelEl: document.getElementById('ed-model'), ttaEl: document.getElementById('ed-tta'),
+  sizeEl: document.getElementById('ed-size'), softEl: document.getElementById('ed-soft'),
+  versEl: document.getElementById('ed-versions'),
+  src: null, opts: null, anchor: null, W: 0, H: 0,
+  versions: [],          // {label, img: ImageBitmap, points, model, tta}
+  basePoints: [],        // the card's own clicks: the starting point, not undoable
+  acts: [], undone: [],  // one stack for clicks, strokes, selection ops, version switches
+  open: 0,               // bumped on every open and close: async answers check it
+  tool: 'pick', label: 1, mode: 'restore', view: 'result', bd: '',
+  zoom: 1, fit: 1, compare: 50, mask: null, seq: 0, cur: null, mouse: null,
+  job: null, ctrl: null,
+  tmp: document.createElement('canvas'), tmp2: document.createElement('canvas'),
 };
 
 async function loadImage(url) {
   const img = new Image(); img.src = url; await img.decode(); return img;
 }
-async function openBrush(src, opts, anchor) {
-  Object.assign(br, { src, opts, anchor, strokes: [], undone: [], cur: null, mouse: null });
-  br.el.hidden = false;
-  br.msg.textContent = 'Loading…';
+
+// opts are the card's real options (what produced it); model only seeds the
+// Generate select, so a card can be re-run with another model from here
+async function openEditor(src, opts, anchor, model) {
+  const open = ++ed.open;
+  Object.assign(ed, {
+    src, opts, anchor, versions: [], acts: [], undone: [], W: 0, H: 0,
+    basePoints: (opts.points || []).map(p => [...p]),
+    mask: null, cur: null, mouse: null, job: null, ctrl: null, compare: 50,
+  });
+  ed.el.hidden = false;
+  ed.msg.textContent = 'Loading…';
+  ed.modelEl.innerHTML = optionsHtml(model || opts.model);
+  ed.ttaEl.checked = !!opts.tta;
+  setTool('pick'); setLabel(1); setBrushMode(ed.mode); setBd(ed.bd); setView('result');
+  edVersions(); edButtons();
   try {
-    await ensureAwake();            // asleep, the sleeper would serve a 503 instead of the images
-    if (br.el.hidden) return;       // closed while waking
+    await ensureAwake();         // asleep, the sleeper would serve a 503 instead of the images
+    if (open !== ed.open) return;                  // closed while waking
     const [cut, orig] = await Promise.all([
       loadImage(`/api/history/${src.id}/cut`), loadImage(`/api/history/${src.id}/orig`)]);
-    br.base = cut;
-    br.orig = document.createElement('canvas');
-    br.orig.width = cut.naturalWidth; br.orig.height = cut.naturalHeight;
-    br.orig.getContext('2d').drawImage(orig, 0, 0, cut.naturalWidth, cut.naturalHeight);
-    br.work.width = cut.naturalWidth; br.work.height = cut.naturalHeight;
-    br.sizeEl.max = Math.max(50, Math.round(cut.naturalWidth / 4));
-    br.sizeEl.value = Math.max(8, Math.round(cut.naturalWidth / 40));
+    const bmp = await createImageBitmap(cut);
+    if (open !== ed.open) { bmp.close(); return; }
+    const W = ed.W = cut.naturalWidth, H = ed.H = cut.naturalHeight;
+    ed.orig.width = W; ed.orig.height = H;
+    ed.orig.getContext('2d').drawImage(orig, 0, 0, W, H);
+    ed.work.width = W; ed.work.height = H;
+    const s = Math.min(1, 2000 / Math.max(W, H));  // the overlay never needs full resolution
+    ed.maskC.width = Math.round(W * s); ed.maskC.height = Math.round(H * s);
+    ed.sizeEl.max = Math.max(50, Math.round(W / 4));
+    ed.sizeEl.value = Math.max(8, Math.round(W / 40));
+    ed.versions = [{ label: 'from card', img: bmp, points: ed.basePoints.map(p => [...p]),
+                     model: opts.model, tta: !!opts.tta }];
     setZoom('fit');
-    replay();
-    br.msg.textContent = 'Paint over what to bring back or erase';
-  } catch (e) { br.msg.textContent = 'Failed: ' + e.message; }
+    edReplay();
+    ed.msg.textContent = edIdle();
+    refreshMask();               // a picked card opens with its selection already showing
+  } catch (e) {
+    if (open === ed.open) ed.msg.textContent = 'Failed: ' + e.message;
+  }
 }
-function closeBrush() {
-  if (br.strokes.length && !confirm('Discard the brush changes?')) return;
-  br.el.hidden = true; br.base = br.orig = null; br.strokes = []; br.work.width = 1;
+function closeEditor(force) {
+  if (!force && ed.acts.length && !confirm('Discard the changes in the editor?')) return;
+  if (ed.ctrl) {                 // a Generate in flight: drop it here and on the server
+    ed.ctrl.abort();
+    const b = new FormData(); b.append('job', ed.job);
+    fetch('/api/cancel', { method: 'POST', body: b });
+  }
+  ed.open++;                     // whatever is still in flight is stale now
+  ed.el.hidden = true;
+  ed.versions.forEach(v => v.img.close());
+  Object.assign(ed, { versions: [], acts: [], undone: [], basePoints: [], mask: null,
+                      cur: null, mouse: null, job: null, ctrl: null, W: 0, H: 0 });
+  ed.work.width = ed.orig.width = ed.maskC.width = ed.tmp2.width = 1;
 }
-function brushButtons() {
-  br.undo.disabled = !br.strokes.length; br.redo.disabled = !br.undone.length;
-  br.reset.disabled = !br.strokes.length; br.go.disabled = !br.strokes.length;
+
+// ---- derived state: everything is folded out of `acts`, so undo is a pop
+function edPoints() {
+  let pts = ed.basePoints.map(p => [...p]);
+  for (const a of ed.acts) {
+    if (a.t === 'click') pts.push(a.p);
+    else if (a.t === 'sel' || a.t === 'clear') pts = [];
+  }
+  return pts;
 }
-function setZoom(z) {
-  const maxW = window.innerWidth * .94, maxH = window.innerHeight - 130;
-  br.fit = Math.min(1, maxW / br.work.width, maxH / br.work.height);
-  const steps = [br.fit, 1, 2, 4].filter((v, i, a) => a.indexOf(v) === i).sort((a, b) => a - b);
-  if (z === 'fit') br.zoom = br.fit;
-  else if (z === 'in') br.zoom = steps.find(s => s > br.zoom + 1e-6) || br.zoom;
-  else if (z === 'out') br.zoom = [...steps].reverse().find(s => s < br.zoom - 1e-6) || br.zoom;
-  br.work.style.width = (br.work.width * br.zoom) + 'px';
-  br.work.style.height = (br.work.height * br.zoom) + 'px';
-  requestAnimationFrame(() => {
-    const r = br.stage.getBoundingClientRect();
-    br.ring.width = r.width; br.ring.height = r.height;
-    br.ring.style.width = r.width + 'px'; br.ring.style.height = r.height + 'px';
-    drawRing();
+function edVersion() {
+  let v = 0;
+  for (const a of ed.acts) if (a.t === 'version') v = a.to;
+  return Math.min(v, ed.versions.length - 1);
+}
+function edOps() {   // hand-made pixel ops: they are what makes a result "edited"
+  return ed.acts.filter(a => a.t === 'stroke' || a.t === 'sel').length;
+}
+function edSaveable() {   // a click alone changes no pixel, so it is nothing to save
+  return ed.acts.some(a => a.t === 'stroke' || a.t === 'sel' || a.t === 'version');
+}
+function edIdle() {
+  return ed.tool === 'brush' ? 'Paint over what to bring back or erase'
+                             : 'Click the object you want to keep';
+}
+
+function edReplay() {
+  const ctx = ed.work.getContext('2d');
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.clearRect(0, 0, ed.W, ed.H);
+  const v = ed.versions[edVersion()];
+  if (v) ctx.drawImage(v.img, 0, 0, ed.W, ed.H);
+  for (const a of ed.acts) {
+    if (a.t === 'stroke') {
+      stamp(ctx, a.pts[0][0], a.pts[0][1], a);
+      for (let i = 1; i < a.pts.length; i++) segment(ctx, a.pts[i - 1], a.pts[i], a);
+    } else if (a.t === 'sel' && a.mode === 'erase') {
+      ctx.globalCompositeOperation = 'destination-out';
+      ctx.drawImage(a.mask, 0, 0, ed.W, ed.H);
+    } else if (a.t === 'sel') {
+      // restore: the original seen through the mask, painted over the result
+      const t = ed.tmp2; t.width = ed.W; t.height = ed.H;      // resizing clears it
+      const tc = t.getContext('2d');
+      tc.drawImage(a.mask, 0, 0, ed.W, ed.H);
+      tc.globalCompositeOperation = 'source-in';
+      tc.drawImage(ed.orig, 0, 0);
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.drawImage(t, 0, 0);
+    }
+    ctx.globalCompositeOperation = 'source-over';
+  }
+  edButtons(); edVersions();
+}
+function pushAct(a) {
+  ed.acts.push(a); ed.undone = [];
+  // a stroke is already on the canvas, only the pixel ops below need a replay
+  if (a.t === 'sel' || a.t === 'version') edReplay(); else edButtons();
+  if (a.t !== 'stroke' && a.t !== 'version') refreshMask();
+}
+function edUndo() {
+  if (ed.cur || !ed.acts.length) return;          // not in the middle of a stroke
+  const a = ed.acts[ed.acts.length - 1];
+  ed.undone.push(ed.acts.pop());
+  if (a.t !== 'click' && a.t !== 'clear') edReplay();
+  if (a.t === 'sel') { ed.seq++; ed.mask = a.mask; drawMask(); edButtons(); }   // no refetch
+  else if (a.t === 'click' || a.t === 'clear') refreshMask();
+}
+function edRedo() {
+  if (ed.cur || !ed.undone.length) return;
+  const a = ed.undone.pop();
+  ed.acts.push(a);
+  if (a.t !== 'click' && a.t !== 'clear') edReplay();
+  if (a.t === 'sel') { ed.seq++; ed.mask = null; drawMask(); edButtons(); }
+  else if (a.t === 'click' || a.t === 'clear') refreshMask();
+}
+function edButtons() {
+  ed.undoB.disabled = ed.resetB.disabled = !ed.acts.length;
+  ed.redoB.disabled = !ed.undone.length;
+  ed.clearB.disabled = !edPoints().length;
+  ed.selErase.disabled = ed.selRestore.disabled = !ed.mask;
+  ed.done.disabled = !edSaveable() || !!ed.job;
+  ed.gen.textContent = ed.job ? 'Cancel' : 'Generate';
+}
+function edVersions() {
+  const cur = edVersion();
+  ed.versEl.innerHTML = '';
+  ed.versions.forEach((v, i) => {
+    if (!v.thumb) {                                  // drawn once, then just moved
+      const c = v.thumb = document.createElement('canvas');
+      c.className = 'checkers'; c.width = c.height = 64;
+      const s = Math.min(64 / v.img.width, 64 / v.img.height);
+      const w = v.img.width * s, h = v.img.height * s;
+      c.getContext('2d').drawImage(v.img, (64 - w) / 2, (64 - h) / 2, w, h);
+    }
+    const b = document.createElement('button');
+    b.className = 'ghost ed-ver';
+    b.setAttribute('aria-pressed', i === cur);
+    b.appendChild(v.thumb);
+    b.appendChild(document.createTextNode(v.label));
+    b.onclick = () => { if (i !== edVersion()) pushAct({ t: 'version', from: edVersion(), to: i }); };
+    ed.versEl.appendChild(b);
   });
 }
+
+// ---- brush: Restore stamps the original's pixels back through a soft
+// circle, Erase cuts alpha with destination-out. Strokes are kept as data and
+// replayed, so no pixel snapshots pile up.
 function brushGrad(ctx, x, y, r, soft) {
   const g = ctx.createRadialGradient(x, y, 0, x, y, r);
   g.addColorStop(0, 'rgba(0,0,0,1)');
@@ -1222,12 +1270,12 @@ function stamp(ctx, x, y, s) {
     return;
   }
   const x0 = Math.floor(x - r) - 1, y0 = Math.floor(y - r) - 1, n = Math.ceil(r * 2) + 3;
-  const t = br.tmp; t.width = n; t.height = n;                  // resizing clears it
+  const t = ed.tmp; t.width = n; t.height = n;                  // resizing clears it
   const tc = t.getContext('2d');
   tc.fillStyle = brushGrad(tc, x - x0, y - y0, r, s.soft);
   tc.beginPath(); tc.arc(x - x0, y - y0, r, 0, 7); tc.fill();
   tc.globalCompositeOperation = 'source-in';
-  tc.drawImage(br.orig, x0, y0, n, n, 0, 0, n, n);
+  tc.drawImage(ed.orig, x0, y0, n, n, 0, 0, n, n);
   ctx.globalCompositeOperation = 'source-over';
   ctx.drawImage(t, x0, y0);
 }
@@ -1237,97 +1285,315 @@ function segment(ctx, a, b, s) {
   for (let i = 1; i <= k; i++)
     stamp(ctx, a[0] + (b[0] - a[0]) * i / k, a[1] + (b[1] - a[1]) * i / k, s);
 }
-function replay() {
-  const ctx = br.work.getContext('2d');
-  ctx.globalCompositeOperation = 'source-over';
-  ctx.clearRect(0, 0, br.work.width, br.work.height);
-  ctx.drawImage(br.base, 0, 0);
-  for (const s of br.strokes) {
-    stamp(ctx, s.pts[0][0], s.pts[0][1], s);
-    for (let i = 1; i < s.pts.length; i++) segment(ctx, s.pts[i - 1], s.pts[i], s);
-  }
-  brushButtons();
-}
 function drawRing() {
-  const c = br.ring, ctx = c.getContext('2d');
+  const c = ed.ring, ctx = c.getContext('2d');
   ctx.clearRect(0, 0, c.width, c.height);
-  if (!br.mouse) return;
-  const r = br.sizeEl.value * br.zoom / 2;
-  ctx.beginPath(); ctx.arc(br.mouse[0], br.mouse[1], r, 0, 7);
-  ctx.lineWidth = 1.5; ctx.strokeStyle = br.mode === 'erase' ? '#ff5252' : '#3ddc84'; ctx.stroke();
-  ctx.beginPath(); ctx.arc(br.mouse[0], br.mouse[1], r, 0, 7);
+  if (!ed.mouse || ed.tool !== 'brush') return;
+  const r = ed.sizeEl.value * ed.zoom / 2;
+  ctx.beginPath(); ctx.arc(ed.mouse[0], ed.mouse[1], r, 0, 7);
+  ctx.lineWidth = 1.5; ctx.strokeStyle = ed.mode === 'erase' ? '#ff5252' : '#3ddc84'; ctx.stroke();
+  ctx.beginPath(); ctx.arc(ed.mouse[0], ed.mouse[1], r, 0, 7);
   ctx.strokeStyle = 'rgba(0,0,0,.6)'; ctx.lineWidth = .5; ctx.stroke();
 }
-function brushPos(e) {
-  const r = br.work.getBoundingClientRect();
-  return [(e.clientX - r.left) / br.zoom, (e.clientY - r.top) / br.zoom];
+
+// ---- SAM mask: preview from the server, hardened, drawn over everything
+// the preview's soft alpha would leave half-transparent ghosts behind a
+// destination-out, so remap it to a hard edge with a small feather
+function hardenMask(img) {
+  const c = document.createElement('canvas');
+  c.width = img.naturalWidth; c.height = img.naturalHeight;
+  const ctx = c.getContext('2d');
+  ctx.drawImage(img, 0, 0);
+  const d = ctx.getImageData(0, 0, c.width, c.height), px = d.data;
+  for (let i = 3; i < px.length; i += 4) {
+    const t = Math.min(1, Math.max(0, (px[i] - 104) / 48));     // smoothstep around 128 ± 24
+    px[i] = Math.round(255 * t * t * (3 - 2 * t));
+  }
+  ctx.putImageData(d, 0, 0);
+  return c;
 }
-br.work.addEventListener('pointerdown', e => {
-  if (e.button !== 0) return;
-  e.preventDefault();
-  br.work.setPointerCapture(e.pointerId);
-  const p = brushPos(e);
-  br.cur = { mode: br.mode, size: +br.sizeEl.value, soft: br.softEl.value / 100, pts: [p] };
-  stamp(br.work.getContext('2d'), p[0], p[1], br.cur);
-});
-br.work.addEventListener('pointermove', e => {
-  if (!br.cur) return;
-  const p = brushPos(e), last = br.cur.pts[br.cur.pts.length - 1];
-  if (Math.hypot(p[0] - last[0], p[1] - last[1]) < 1) return;
-  segment(br.work.getContext('2d'), last, p, br.cur);
-  br.cur.pts.push(p);
-});
-function endStroke() {
-  if (!br.cur) return;
-  br.strokes.push(br.cur); br.undone = []; br.cur = null;
-  brushButtons();
+async function refreshMask() {
+  const seq = ++ed.seq, open = ed.open, pts = edPoints();
+  if (!pts.length) {
+    ed.mask = null; drawMask(); edButtons();
+    if (!ed.job) ed.msg.textContent = edIdle();
+    return;
+  }
+  ed.msg.textContent = ed.mask ? 'Selecting…' : 'Reading the image…';
+  const body = new FormData();
+  body.append('source', ed.src.id); body.append('points', JSON.stringify(pts));
+  try {
+    await ensureAwake();
+    const res = await fetch('/api/sam', { method: 'POST', body });
+    if (!res.ok) throw new Error(await res.text());
+    const img = await loadImage(URL.createObjectURL(await res.blob()));
+    if (seq !== ed.seq || open !== ed.open) return;   // a newer click already answered
+    ed.mask = hardenMask(img);
+    ed.msg.textContent = 'Bright with green outline = selected · apply it here or Generate';
+  } catch (e) {
+    if (seq !== ed.seq || open !== ed.open) return;
+    ed.msg.textContent = 'Failed: ' + e.message;
+  }
+  drawMask(); edButtons();
 }
-br.work.addEventListener('pointerup', endStroke);
-br.work.addEventListener('pointercancel', endStroke);
-br.stage.addEventListener('pointermove', e => {
-  const r = br.stage.getBoundingClientRect();
-  br.mouse = [e.clientX - r.left, e.clientY - r.top]; drawRing();
-});
-br.stage.addEventListener('pointerleave', () => { br.mouse = null; drawRing(); });
+function drawMask() {
+  const c = ed.maskC, ctx = c.getContext('2d');
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  ctx.clearRect(0, 0, c.width, c.height);
+  if (ed.mask) {
+    // selected = full brightness with a green outline, the rest dimmed hard
+    ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.fillRect(0, 0, c.width, c.height);
+    ctx.globalCompositeOperation = 'destination-out';
+    ctx.drawImage(ed.mask, 0, 0, c.width, c.height);
+    // outline: the mask in green, grown by d px, minus the mask itself
+    const d = Math.max(2, Math.round(c.width / 500));
+    const shape = document.createElement('canvas'); shape.width = c.width; shape.height = c.height;
+    const sc = shape.getContext('2d');
+    sc.drawImage(ed.mask, 0, 0, c.width, c.height);
+    sc.globalCompositeOperation = 'source-in'; sc.fillStyle = '#3ddc84'; sc.fillRect(0, 0, c.width, c.height);
+    const ring = document.createElement('canvas'); ring.width = c.width; ring.height = c.height;
+    const rc = ring.getContext('2d');
+    for (const [dx, dy] of [[d, 0], [-d, 0], [0, d], [0, -d], [d, d], [-d, -d], [d, -d], [-d, d]])
+      rc.drawImage(shape, dx, dy);
+    rc.globalCompositeOperation = 'destination-out'; rc.drawImage(shape, 0, 0);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.drawImage(ring, 0, 0);
+  }
+  // dots sit on the stretched canvas, so their radius follows how small it is drawn
+  const sx = c.width / (ed.W || 1), rad = 6 * c.width / (ed.wrap.clientWidth || c.width);
+  for (const [x, y, l] of edPoints()) {
+    ctx.beginPath(); ctx.arc(x * sx, y * sx, rad, 0, 7);
+    ctx.fillStyle = l ? '#3ddc84' : '#ff5252'; ctx.fill();
+    ctx.lineWidth = rad / 3; ctx.strokeStyle = '#fff'; ctx.stroke();
+  }
+}
+
+// ---- tools, view, zoom
+function setTool(t) {
+  ed.tool = t;
+  document.querySelectorAll('.ed-tool').forEach(b => b.setAttribute('aria-pressed', b.dataset.tool === t));
+  document.getElementById('ed-pick').hidden = t !== 'pick';
+  document.getElementById('ed-brush').hidden = t !== 'brush';
+  ed.el.classList.toggle('brush', t === 'brush');
+  if (!ed.job && !ed.mask) ed.msg.textContent = edIdle();
+  drawRing(); edHint();
+}
+function setLabel(l) {
+  ed.label = l;
+  document.querySelectorAll('.ed-label').forEach(b => b.setAttribute('aria-pressed', +b.dataset.label === l));
+}
 function setBrushMode(m) {
-  br.mode = m;
-  document.querySelectorAll('.br-tool').forEach(b => b.setAttribute('aria-pressed', b.dataset.mode === m));
+  ed.mode = m;
+  document.querySelectorAll('.ed-mode').forEach(b => b.setAttribute('aria-pressed', b.dataset.mode === m));
   drawRing();
 }
-document.querySelectorAll('.br-tool').forEach(b => b.addEventListener('click', () => setBrushMode(b.dataset.mode)));
-document.querySelectorAll('.br-view').forEach(b => b.addEventListener('click', () => {
-  br.work.className = b.dataset.view;
-  document.querySelectorAll('.br-view').forEach(v => v.setAttribute('aria-pressed', v === b));
-}));
-br.sizeEl.addEventListener('input', drawRing);
-br.undo.addEventListener('click', () => { if (br.strokes.length) { br.undone.push(br.strokes.pop()); replay(); } });
-br.redo.addEventListener('click', () => { if (br.undone.length) { br.strokes.push(br.undone.pop()); replay(); } });
-br.reset.addEventListener('click', () => { br.strokes = []; br.undone = []; replay(); });
-document.getElementById('br-zoomin').addEventListener('click', () => setZoom('in'));
-document.getElementById('br-zoomout').addEventListener('click', () => setZoom('out'));
-document.getElementById('br-zoomfit').addEventListener('click', () => setZoom('fit'));
-document.getElementById('br-close').addEventListener('click', closeBrush);
-br.go.addEventListener('click', async () => {
-  br.go.disabled = true; br.msg.textContent = 'Saving…';
-  const blob = await new Promise(r => br.work.toBlob(r, 'image/png'));
-  const { src, opts, anchor, strokes } = br;
-  // the overlay stays open until the save succeeded: a failed upload must
-  // not throw the painting away
-  const ok = await run(src, { ...opts, edited: true }, anchor, { url: '/api/edit', blob, strokes: strokes.length });
-  if (ok) { br.strokes = []; closeBrush(); }          // applied, nothing to discard
-  else { br.msg.textContent = 'Saving failed (the card behind says why); the strokes are kept, try again'; brushButtons(); }
+function setView(v) {
+  ed.view = v;
+  document.querySelectorAll('.ed-view').forEach(b => b.setAttribute('aria-pressed', b.dataset.view === v));
+  ed.orig.hidden = v === 'result';
+  ed.work.hidden = v === 'orig';
+  ed.handle.hidden = v !== 'compare';
+  setCompare(ed.compare);
+}
+function setCompare(p) {   // original on the left of the handle, result on the right
+  ed.compare = Math.min(100, Math.max(0, p));
+  ed.work.style.clipPath = ed.view === 'compare' ? `inset(0 0 0 ${ed.compare}%)` : '';
+  ed.handle.style.left = ed.compare + '%';
+}
+function setBd(v) {
+  ed.bd = v;
+  ed.work.className = 'checkers ' + v;
+  document.querySelectorAll('.ed-bd').forEach(b => b.setAttribute('aria-pressed', b.dataset.bd === v));
+}
+function setZoom(z) {
+  if (!ed.W) return;
+  ed.fit = Math.min(1, (ed.stage.clientWidth - 8) / ed.W, (ed.stage.clientHeight - 8) / ed.H);
+  const steps = [ed.fit, 1, 2, 4].filter((v, i, a) => a.indexOf(v) === i).sort((a, b) => a - b);
+  if (z === 'fit') ed.zoom = ed.fit;
+  else if (z === 'in') ed.zoom = steps.find(s => s > ed.zoom + 1e-6) || ed.zoom;
+  else if (z === 'out') ed.zoom = [...steps].reverse().find(s => s < ed.zoom - 1e-6) || ed.zoom;
+  ed.wrap.style.width = (ed.W * ed.zoom) + 'px';
+  ed.wrap.style.height = (ed.H * ed.zoom) + 'px';
+  requestAnimationFrame(() => {
+    const r = ed.stage.getBoundingClientRect();
+    ed.ring.width = r.width; ed.ring.height = r.height;
+    ed.ring.style.width = r.width + 'px'; ed.ring.style.height = r.height + 'px';
+    drawRing(); drawMask();
+  });
+}
+function edHint() {
+  const s = MODELS.sam || {};
+  const tool = ed.tool === 'brush'
+    ? 'drag to paint · [ ] size · X swaps Restore/Erase'
+    : (s.downloaded ? '' : `first use downloads SAM 2 (~${s.size_mb} MB) · `) +
+      'click = keep · ⌥-click or right-click = exclude · Erase/Restore selection applies it ' +
+      'here · Generate reruns the model with the clicks';
+  ed.hint.textContent = tool + ' · ⌘Z undo · ⌘⇧Z redo · Enter = Done · Esc closes';
+}
+
+// ---- pointer work. Every layer is pointer-events:none, so the wrap is the
+// target in all view modes, the clipped Compare one included.
+function edPos(e) {
+  const r = ed.wrap.getBoundingClientRect();
+  return [(e.clientX - r.left) / ed.zoom, (e.clientY - r.top) / ed.zoom];
+}
+function edClick(e, label) {
+  const [x, y] = edPos(e);
+  pushAct({ t: 'click', p: [Math.round(x), Math.round(y), label] });
+}
+ed.wrap.addEventListener('pointerdown', e => {
+  if (e.button !== 0 || !ed.W) return;
+  e.preventDefault();
+  if (ed.tool === 'pick') { edClick(e, e.altKey ? 0 : ed.label); return; }
+  if (ed.view === 'orig') setView('result');       // paint on what the stroke changes
+  ed.wrap.setPointerCapture(e.pointerId);
+  const p = edPos(e);
+  ed.cur = { t: 'stroke', mode: ed.mode, size: +ed.sizeEl.value, soft: ed.softEl.value / 100, pts: [p] };
+  stamp(ed.work.getContext('2d'), p[0], p[1], ed.cur);
 });
-window.addEventListener('resize', () => { if (!br.el.hidden) setZoom(br.zoom === br.fit ? 'fit' : 'same'); });
+ed.wrap.addEventListener('pointermove', e => {
+  if (!ed.cur) return;
+  const p = edPos(e), last = ed.cur.pts[ed.cur.pts.length - 1];
+  if (Math.hypot(p[0] - last[0], p[1] - last[1]) < 1) return;
+  segment(ed.work.getContext('2d'), last, p, ed.cur);
+  ed.cur.pts.push(p);
+});
+function endStroke() {
+  if (!ed.cur) return;
+  const s = ed.cur; ed.cur = null;
+  pushAct(s);
+}
+ed.wrap.addEventListener('pointerup', endStroke);
+ed.wrap.addEventListener('pointercancel', endStroke);
+ed.wrap.addEventListener('contextmenu', e => {
+  e.preventDefault();
+  if (ed.tool === 'pick' && ed.W) edClick(e, 0);
+});
+ed.stage.addEventListener('pointermove', e => {
+  const r = ed.stage.getBoundingClientRect();
+  ed.mouse = [e.clientX - r.left, e.clientY - r.top]; drawRing();
+});
+ed.stage.addEventListener('pointerleave', () => { ed.mouse = null; drawRing(); });
+ed.handle.addEventListener('pointerdown', e => {
+  e.preventDefault(); e.stopPropagation();          // dragging the handle is not a stroke
+  ed.handle.setPointerCapture(e.pointerId);
+  const move = ev => {
+    const r = ed.wrap.getBoundingClientRect();
+    setCompare((ev.clientX - r.left) / r.width * 100);
+  };
+  const up = () => { ed.handle.onpointermove = ed.handle.onpointerup = ed.handle.onpointercancel = null; };
+  ed.handle.onpointermove = move; ed.handle.onpointerup = ed.handle.onpointercancel = up;
+});
+
+// ---- panel wiring
+document.querySelectorAll('.ed-tool').forEach(b => b.addEventListener('click', () => setTool(b.dataset.tool)));
+document.querySelectorAll('.ed-label').forEach(b => b.addEventListener('click', () => setLabel(+b.dataset.label)));
+document.querySelectorAll('.ed-mode').forEach(b => b.addEventListener('click', () => setBrushMode(b.dataset.mode)));
+document.querySelectorAll('.ed-view').forEach(b => b.addEventListener('click', () => setView(b.dataset.view)));
+document.querySelectorAll('.ed-bd').forEach(b => b.addEventListener('click', () => setBd(b.dataset.bd)));
+document.getElementById('ed-zoomin').addEventListener('click', () => setZoom('in'));
+document.getElementById('ed-zoomout').addEventListener('click', () => setZoom('out'));
+document.getElementById('ed-zoomfit').addEventListener('click', () => setZoom('fit'));
+ed.sizeEl.addEventListener('input', drawRing);
+ed.undoB.addEventListener('click', edUndo);
+ed.redoB.addEventListener('click', edRedo);
+ed.resetB.addEventListener('click', () => {
+  ed.acts = []; ed.undone = []; edReplay(); refreshMask();
+});
+ed.clearB.addEventListener('click', () => { if (edPoints().length) pushAct({ t: 'clear' }); });
+// applying a selection here costs no model run, but its edges are as coarse
+// as the SAM preview; the hint sends fine work to Generate
+ed.selErase.addEventListener('click', () => selApply('erase'));
+ed.selRestore.addEventListener('click', () => selApply('restore'));
+function selApply(mode) {
+  if (!ed.mask) return;
+  pushAct({ t: 'sel', mode, mask: ed.mask, points: edPoints() });
+}
+document.getElementById('ed-close').addEventListener('click', () => closeEditor());
+
+// Generate: a normal /api/cutout run, but draft=1 so it stays in the editor
+// instead of becoming a card, and always transparent (Done flattens)
+ed.gen.addEventListener('click', async () => {
+  if (ed.job) {                    // running: the button reads Cancel
+    ed.ctrl.abort();
+    const b = new FormData(); b.append('job', ed.job);
+    fetch('/api/cancel', { method: 'POST', body: b });
+    return;
+  }
+  if (!ed.W) return;
+  const model = ed.modelEl.value, tta = ed.ttaEl.checked, pts = edPoints();
+  const open = ed.open, job = crypto.randomUUID();
+  ed.job = job; ed.ctrl = new AbortController();
+  const body = new FormData();
+  body.append('source', ed.src.id);
+  body.append('bg', '');
+  body.append('model', model);
+  body.append('tta', tta ? '1' : '');
+  body.append('job', job);
+  body.append('draft', '1');
+  if (pts.length) body.append('points', JSON.stringify(pts));
+  busy++; working[model] = (working[model] || 0) + 1; JOBS[job] = ed.msg;
+  edButtons(); refreshStatus();
+  try {
+    ed.msg.textContent = 'starting…';
+    await ensureAwake();
+    if (ed.ctrl.signal.aborted) throw new DOMException('cancelled', 'AbortError');
+    ed.msg.textContent = 'sending…';
+    const res = await fetch('/api/cutout', { method: 'POST', body, signal: ed.ctrl.signal });
+    if (!res.ok) throw new Error(await res.text());
+    const img = await createImageBitmap(await res.blob());
+    if (open !== ed.open) { img.close(); return; }     // closed while it ran
+    const n = pts.length;
+    ed.versions.push({ img, points: pts, model, tta,
+      label: LABEL[model] + (n ? ` · ${n} click${n > 1 ? 's' : ''}` : '') });
+    pushAct({ t: 'version', from: edVersion(), to: ed.versions.length - 1 });
+    ed.msg.textContent = 'New version · pick an older one in Versions to go back';
+    const m = MODELS.find(x => x.name === model);
+    if (m && !m.downloaded) loadModels().catch(() => {});   // first use just fetched the weights
+  } catch (err) {
+    if (open !== ed.open) return;
+    ed.msg.textContent = err.name === 'AbortError' ? 'Generate cancelled' : 'Failed: ' + err.message;
+  } finally {
+    busy--; working[model]--; delete JOBS[job]; refreshStatus();
+    if (open === ed.open) { ed.job = null; ed.ctrl = null; edButtons(); }
+  }
+});
+
+// Done: the composed pixels become a card, tagged with the model, clicks and
+// extra pass of the version they came from
+ed.done.addEventListener('click', async () => {
+  if (ed.done.disabled) return;
+  ed.done.disabled = true; ed.msg.textContent = 'Saving…';
+  const v = ed.versions[edVersion()], ops = edOps();
+  const blob = await new Promise(r => ed.work.toBlob(r, 'image/png'));
+  // the editor stays open until the save succeeded: a failed upload must not
+  // throw the work away
+  const ok = await run(ed.src, { ...ed.opts, model: v.model, tta: v.tta, points: v.points,
+                                 edited: ops > 0 },
+                       ed.anchor, { url: '/api/edit', blob, strokes: ops });
+  if (ok) closeEditor(true);
+  else { ed.msg.textContent = 'Saving failed (the card behind says why); your changes are kept'; edButtons(); }
+});
+
+window.addEventListener('resize', () => { if (!ed.el.hidden) setZoom(ed.zoom === ed.fit ? 'fit' : 'same'); });
 window.addEventListener('keydown', e => {
-  if (br.el.hidden) return;
-  if (e.key === 'Escape') closeBrush();
-  else if (e.key === 'Enter' && !br.go.disabled) br.go.click();
-  else if (e.key.toLowerCase() === 'z' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); (e.shiftKey ? br.redo : br.undo).click(); }
-  else if (e.key === '[') { br.sizeEl.value = Math.max(2, br.sizeEl.value / 1.25); drawRing(); }
-  else if (e.key === ']') { br.sizeEl.value = Math.min(br.sizeEl.max, br.sizeEl.value * 1.25); drawRing(); }
-  else if (e.key === 'x' || e.key === 'X') setBrushMode(br.mode === 'erase' ? 'restore' : 'erase');
-  else if (e.key === 'e' || e.key === 'E') setBrushMode('erase');
+  if (ed.el.hidden) return;
+  const typing = /^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName);
+  if (e.key === 'Escape') closeEditor();
+  else if (e.key === 'Enter') { e.preventDefault(); if (!ed.done.disabled) ed.done.click(); }
+  else if (e.key.toLowerCase() === 'z' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); (e.shiftKey ? edRedo : edUndo)(); }
+  else if (typing) return;             // a slider or the model menu has the keys
+  else if (e.key === '[') { ed.sizeEl.value = Math.max(2, ed.sizeEl.value / 1.25); drawRing(); }
+  else if (e.key === ']') { ed.sizeEl.value = Math.min(ed.sizeEl.max, ed.sizeEl.value * 1.25); drawRing(); }
+  else if (e.key === '1') setView('orig');
+  else if (e.key === '2') setView('result');
+  else if (e.key === '3') setView('compare');
+  else if (e.key === 'p' || e.key === 'P') setTool('pick');
+  else if (e.key === 'b' || e.key === 'B') setTool('brush');
   else if (e.key === 'r' || e.key === 'R') setBrushMode('restore');
+  else if (e.key === 'e' || e.key === 'E') setBrushMode('erase');
+  else if (e.key === 'x' || e.key === 'X') setBrushMode(ed.mode === 'erase' ? 'restore' : 'erase');
 });
 
 (async () => {
@@ -1477,10 +1743,18 @@ def api_history_cut(hid: str):
 
 
 @app.post("/api/edit")
-def api_edit(source: str = Form(""), image: UploadFile = File(...), strokes: int = Form(0)):
-    """A cutout retouched with the brush in the browser: store it as a new
-    history entry next to its source (same original, background, model)."""
+def api_edit(source: str = Form(""), image: UploadFile = File(...), strokes: int = Form(0),
+             model: str = Form(""), tta: str = Form(""), points: str | None = Form(None)):
+    """A cutout composed in the browser's editor (brush strokes, selection
+    ops, a generated version, or all three): store it as a new history entry
+    next to its source (same original and background). model/tta/points say
+    what really produced these pixels and override the source's meta; without
+    them the source's own are copied. `strokes` counts the pixel ops by
+    hand, so `edited` marks only what a person painted."""
     meta = history_meta(source)
+    if model and model not in rmbg.MODELS:
+        return Response(f"unknown model {model!r}", status_code=400)
+    pts = meta.get("points", []) if points is None else parse_points(points)
     bg = str(meta.get("bg") or "")
     background = parse_bg(bg)
     rgba = Image.open(io.BytesIO(image.file.read())).convert("RGBA")
@@ -1491,8 +1765,8 @@ def api_edit(source: str = Form(""), image: UploadFile = File(...), strokes: int
     headers = {}
     if STATE["history_days"] > 0:
         headers["X-Id"] = history_save(raw, meta["name"], png, {
-            "model": meta["model"], "bg": bg, "tta": meta.get("tta", False),
-            "points": meta.get("points", []), "edited": True, "strokes": strokes,
+            "model": model or meta["model"], "bg": bg, "tta": bool(tta),
+            "points": pts, "edited": strokes > 0, "strokes": strokes,
             "seconds": 0, "width": rgba.width, "height": rgba.height},
             cut=png_bytes(rgba) if bg else None)
     return Response(png, media_type="image/png", headers=headers)
@@ -1521,6 +1795,7 @@ def api_cutout(
     job: str = Form(""),           # client id, so /api/cancel can skip it
     points: str = Form(""),        # JSON [[x, y, label], ...]: keep only the clicked object
     use_settings: str = Form(""),  # model/bg/tta from the page's settings (Quick Action)
+    draft: str = Form(""),         # editor preview: send the PNG back, write no history
 ):
     # sync endpoint on purpose: FastAPI runs it in a worker thread, so the
     # event loop keeps answering /api/status while the GPU is busy.
@@ -1580,7 +1855,9 @@ def api_cutout(
 
     png = png_bytes(out)
     headers = {"X-Seconds": f"{time.time() - t0:.2f}"}
-    if STATE["history_days"] > 0 and job not in CANCELLED:
+    # a draft is one of the editor's tries, not a result: no entry, no X-Id, so
+    # it never becomes a card (with --history-days 0 nothing is written anyway)
+    if STATE["history_days"] > 0 and job not in CANCELLED and not draft:
         headers["X-Id"] = history_save(raw, name, png, {
             "model": model, "bg": bg, "tta": bool(tta), "points": pts,
             "seconds": round(time.time() - t0, 2),

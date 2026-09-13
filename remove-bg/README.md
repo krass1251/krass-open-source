@@ -55,17 +55,36 @@ Action follows them too). The line
 under the toolbar says what the selected model is good for and whether its
 weights are on disk yet (each is a ~430 MB download on first use, lite 170).
 
-### Pick object: click on what to keep
+### Edit: pick, brush, generate
 
 BiRefNet decides by itself what the subject is, which is right most of the
-time. When a photo has several things in it, **Pick object** on a card opens
-the photo large: click the object to keep, ⌥-click (or right-click) parts to
-drop; what stays is shown bright with a green outline, what goes is dimmed.
-**Redo with selection** makes a new card with only
-that object. Clicks are remembered with the result, so Redo with another
-model keeps the same object and Pick object on that card starts from them.
+time. When it is not — several things in the photo, or a detail the model got
+wrong — **Edit** on a card opens it full-screen, tools on the left, the image
+on a big stage. Two tools share one Undo/Redo stack:
 
-Under the hood this is [SAM 2](https://github.com/facebookresearch/sam2)
+* **Pick** — click the object to keep, ⌥-click (or right-click) parts to drop;
+  what stays is shown bright with a green outline, what goes is dimmed. The
+  selection can be applied right there (**Erase selection** / **Restore
+  selection**, no model run, edges as coarse as the preview) or handed to
+  **Generate**, which reruns the model with the clicks.
+* **Brush** — **Restore** paints the original's pixels back, **Erase** makes
+  them transparent; size and softness sliders, zoom fit/1x/2x/4x for hair.
+
+Every **Generate** adds a version to the list in the panel (in memory, not a
+card): click one to go back to it, strokes and selections stay on top of
+whichever is current. **View** shows the original, the result, or a draggable
+before-after **Compare**, on a checkerboard, white or black. **Done** makes one
+new card above the source with the model, clicks and extra pass of the version
+it came from, tagged `edited` when something was painted by hand; Esc or × asks
+before dropping unsaved work.
+
+Keys: `P` / `B` tool, `R` / `E` / `X` brush mode, `[` `]` size, `1` `2` `3`
+view, `⌘Z` / `⌘⇧Z`, Enter = Done, Esc closes. Clicks are remembered with the
+result, so Redo with another model keeps the same object and Edit on that card
+starts from them. Results that were flattened onto a colour keep their
+transparent cutout on disk (`cut.png`), so the editor works on those too.
+
+Under the hood the clicks are [SAM 2](https://github.com/facebookresearch/sam2)
 (`sam2.1-hiera-small`, 39M parameters, Apache-2.0, ~180 MB download on first
 use) picking the object and BiRefNet doing the edges: the object is cropped
 out with a margin, BiRefNet runs on the crop, and its alpha is kept inside
@@ -74,17 +93,9 @@ used as is (coarser edges, but the right object). SAM runs on the CPU, ~1 s
 to read an image once and ~30 ms per click after that, and shows up in the
 memory line as `sam2` with the same idle unload as the other models.
 
-### Touch up: the brush
-
-When the model got a detail wrong, **Touch up** on a card opens the cutout
-large on a checkerboard (or white / black, to see the edges). **Restore**
-paints the original's pixels back, **Erase** makes them transparent; size and
-softness sliders, zoom to 1x/2x/4x with scrolling for hair, Undo / Redo /
-Reset. **Apply changes** makes a new card above the source, tagged `brush`.
-Keys: `[` `]` size, `X` swaps the tools, `⌘Z` / `⌘⇧Z`, Enter applies, Esc
-closes. Everything happens in the browser on the full-resolution image; no
-model runs. Results that were flattened onto a colour keep their transparent
-cutout on disk (`cut.png`), so the brush works on those too.
+Brush strokes and applied selections happen in the browser on the
+full-resolution image, no model runs; only Generate and Done talk to the
+server, and a generated version is a draft that never becomes a card.
 
 ### History
 
