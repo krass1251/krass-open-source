@@ -5,9 +5,9 @@
 #   the Dock. Starts the server if it is not running (serve.sh) and opens
 #   http://127.0.0.1:8777 in Chrome (default browser if Chrome is missing).
 # * Finder Quick Action "Remove Background": right-click photos > Quick
-#   Actions. Writes <name>.cutout.png next to each file (hr-matting,
-#   transparent) through the same server, so the warm model is reused and the
-#   results show up in the web UI's history as well.
+#   Actions. Writes <name>.cutout.png next to each file with the model and
+#   background last set on the web page, through the same server, so the
+#   warm model is reused and the results show up in the UI's history too.
 # Both point at this folder: re-run after moving the repo. Safe to re-run.
 set -e
 cd "$(dirname "$0")"
@@ -87,7 +87,7 @@ URL="http://127.0.0.1:8777"
 ok=0; failed=0
 for f in "$@"; do
   out="${f%.*}.cutout.png"
-  if /usr/bin/curl -s -f -m 900 -F "image=@\"${f//\"/\\\"}\"" -F model=hr-matting \
+  if /usr/bin/curl -s -f -m 900 -F "image=@\"${f//\"/\\\"}\"" -F use_settings=1 \
        -o "$out" "$URL/api/cutout"; then
     ok=$((ok + 1))
   else

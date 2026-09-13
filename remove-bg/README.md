@@ -46,7 +46,12 @@ a few seconds and is discarded.
 
 The browser only ever talks to `127.0.0.1`; nothing leaves the machine.
 
-Model, background and extra pass are remembered between visits. The line
+While a photo is being processed the card says what is going on: waiting
+for the GPU, downloading or loading the model, processing.
+
+Model, background and extra pass are remembered between visits (in
+`~/Library/Application Support/remove-bg/settings.json`, so the Finder Quick
+Action follows them too). The line
 under the toolbar says what the selected model is good for and whether its
 weights are on disk yet (each is a ~430 MB download on first use, lite 170).
 
@@ -86,7 +91,9 @@ cutout on disk (`cut.png`), so the brush works on those too.
 Every result is kept for 7 days in
 `~/Library/Application Support/remove-bg/history` (original + cutout), so the
 page shows the same cards after a reload or a server restart, and **Redo**
-still works on them. The × in a card's corner removes it from disk at once.
+still works on them. The × in a card's corner deletes it, **Clear all** above
+the cards deletes every finished result; both show a toast with **Undo** for
+5 seconds before anything is removed from disk.
 `--history-days 30` keeps them longer, `--history-days 0` writes nothing to
 disk. Note that big photos make big PNGs: check the folder size if disk space
 is tight.
@@ -106,7 +113,8 @@ repo; safe to re-run):
   is not installed).
 * A Finder Quick Action **Remove Background**: right-click one or more photos
   → Quick Actions → Remove Background, and `<name>.cutout.png` appears next to
-  each file (hr-matting, transparent). It goes through the same server, so
+  each file, with the model and background last set on the web page (so
+  pick them there first). It goes through the same server, so
   the warm model is reused and the results show up in the web UI's history
   too. A notification reports how many were done.
 

@@ -40,7 +40,7 @@ import threading
 import time
 import uuid
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from PIL import Image
 
@@ -54,6 +54,25 @@ STATE = {"device": "auto", "fp32": False, "idle": 60, "last_used": {},
          "last_work": time.time()}
 GPU = threading.Lock()   # one inference at a time; also guards load/unload
 CANCELLED = {}           # job id -> time the client gave up on it
+JOBS = {}                # job id -> stage, for the card's status line
+
+SETTINGS_PATH = os.path.expanduser("~/Library/Application Support/remove-bg/settings.json")
+
+
+def load_settings():
+    """Model, background and extra pass as last set on the page. The page
+    and the Finder Quick Action both follow them."""
+    try:
+        with open(SETTINGS_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(d):
+    os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
+    with open(SETTINGS_PATH, "w") as f:
+        json.dump(d, f)
 
 SLEEPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sleeper.py")
 HISTORY_DIR = os.path.expanduser("~/Library/Application Support/remove-bg/history")
@@ -305,7 +324,21 @@ PAGE = r"""<!doctype html>
     background-size: 12px 12px; background-position: 0 0, 6px 6px;
   }
   .hint { font-size: 12px; color: var(--muted); margin: 0 0 8px; }
-  .cards { display: grid; gap: 14px; margin-top: 18px; }
+  .cards-head {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-top: 22px; font-size: 12px; color: var(--muted);
+  }
+  .cards-head[hidden] { display: none; }
+  .cards { display: grid; gap: 14px; margin-top: 10px; }
+  .card[hidden] { display: none; }
+  #toast {
+    position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); z-index: 5;
+    display: flex; gap: 12px; align-items: center; padding: 8px 10px 8px 16px;
+    background: var(--ink); color: var(--panel); border-radius: 10px; font-size: 13px;
+    box-shadow: 0 6px 24px rgba(0,0,0,.25);
+  }
+  #toast[hidden] { display: none; }
+  #toast .ghost { color: var(--panel); border-color: color-mix(in srgb, var(--panel) 40%, transparent); }
   .card {
     position: relative;
     background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
@@ -462,8 +495,14 @@ PAGE = r"""<!doctype html>
     <button class="ghost" id="quit">Quit</button>
   </div>
 
+  <div class="cards-head" id="cards-head" hidden>
+    <span id="count"></span>
+    <button class="ghost" id="clear" title="delete every finished result (with Undo)">Clear all</button>
+  </div>
   <div class="cards" id="cards"></div>
 </main>
+
+<div id="toast" hidden><span>Deleted</span><button class="ghost" id="undo-del">Undo</button></div>
 
 <div id="picker" hidden>
   <div class="pick-top">
@@ -535,13 +574,11 @@ function esc(s) {
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
-// ---- settings live in localStorage: model, background, extra pass
-const SKEY = 'rmbg.settings';
+// ---- settings (model, background, extra pass) live on the server, so the
+// Finder Quick Action follows them too
 function saveSettings() {
-  try {
-    localStorage.setItem(SKEY, JSON.stringify(
-      { model: modelSel.value, bg, tta: ttaBox.checked }));
-  } catch (e) {}
+  fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: modelSel.value, bg, tta: ttaBox.checked }) }).catch(() => {});
 }
 function setBg(v) {
   bg = v;
@@ -552,9 +589,9 @@ function setBg(v) {
   });
   if (!hit && v) pick.value = v;
 }
-function restoreSettings() {
+async function restoreSettings() {
   let s = {};
-  try { s = JSON.parse(localStorage.getItem(SKEY)) || {}; } catch (e) {}
+  try { s = await (await fetch('/api/settings')).json(); } catch (e) {}
   if (s.model in LABEL) modelSel.value = s.model;
   ttaBox.checked = !!s.tta;
   setBg(s.bg || '');
@@ -613,10 +650,19 @@ function handle(files) {
 // ---- memory status. After 10 min without work the server swaps itself for
 // a tiny sleeper on the same port; dropping a photo (or Wake up) brings it back.
 const wake = document.getElementById('wake');
+const JOBS = {};   // job id -> card, so the server's stage lands on the right card
+const STAGE = {
+  queued: 'waiting for the GPU…', download: 'downloading the model, first use (a few minutes)…',
+  load: 'loading the model…', sam: 'loading SAM 2…', run: 'processing…',
+};
 async function refreshStatus() {
   let s;
   try { s = await (await fetch('/api/status')).json(); }
   catch (e) { stat.textContent = 'server not reachable'; return; }
+  for (const [job, stage] of Object.entries(s.jobs || {})) {
+    const c = JOBS[job];
+    if (c) c.querySelector('.t').textContent = STAGE[stage] || stage;
+  }
   wake.hidden = !s.sleeping;
   if (s.sleeping) {
     chips.innerHTML = '';
@@ -773,11 +819,45 @@ function finish(card, src, opts, out) {
     tu.disabled = false;
     tu.onclick = () => openBrush({ id: out.id, name: src.name }, opts, card);
   }
-  card.querySelector('.del').onclick = async () => {
-    if (out.id) await fetch(`/api/history/${out.id}`, { method: 'DELETE' });
-    card.remove();
-  };
+  card.querySelector('.del').onclick = () => softDelete([card]);
 }
+
+// ---- delete with undo: cards disappear at once, the server is told 5 s
+// later unless Undo is hit. Clear all goes through the same path.
+const trash = { cards: [], timer: null, el: document.getElementById('toast') };
+function softDelete(list) {
+  list.forEach(c => { c.hidden = true; trash.cards.push(c); });
+  clearTimeout(trash.timer);
+  trash.timer = setTimeout(commitDeletes, 5000);
+  const n = trash.cards.length;
+  trash.el.querySelector('span').textContent = n === 1 ? 'Deleted' : `${n} deleted`;
+  trash.el.hidden = false;
+  updateHead();
+}
+function commitDeletes() {
+  for (const c of trash.cards) {
+    if (c.dataset.id) fetch(`/api/history/${c.dataset.id}`, { method: 'DELETE', keepalive: true }).catch(() => {});
+    c.remove();
+  }
+  trash.cards = []; trash.el.hidden = true;
+}
+document.getElementById('undo-del').addEventListener('click', () => {
+  clearTimeout(trash.timer);
+  trash.cards.forEach(c => { c.hidden = false; });
+  trash.cards = []; trash.el.hidden = true;
+  updateHead();
+});
+window.addEventListener('pagehide', () => { if (trash.cards.length) commitDeletes(); });
+document.getElementById('clear').addEventListener('click', () => {
+  const done = [...cards.querySelectorAll('.card:not([hidden])')].filter(c => c.querySelector('.cancel').hidden);
+  if (done.length) softDelete(done);
+});
+function updateHead() {
+  const n = cards.querySelectorAll('.card:not([hidden])').length;
+  document.getElementById('cards-head').hidden = n === 0;
+  document.getElementById('count').textContent = n === 1 ? '1 result' : `${n} results`;
+}
+new MutationObserver(updateHead).observe(cards, { childList: true });
 
 // extra = {url, blob, strokes}: post a brush-edited PNG to /api/edit instead
 // of running the model; the card flow is the same.
@@ -808,10 +888,13 @@ async function run(src, opts, anchor, extra) {
   if (extra && extra.blob) { body.append('image', extra.blob, 'edit.png'); body.append('strokes', extra.strokes); }
 
   const t0 = performance.now();
-  busy++; working[opts.model] = (working[opts.model] || 0) + 1; refreshStatus();
+  const tEl = card.querySelector('.t');
+  busy++; working[opts.model] = (working[opts.model] || 0) + 1; JOBS[job] = card; refreshStatus();
   try {
+    tEl.textContent = 'starting…';
     await ensureAwake();
     if (ctrl.signal.aborted) throw new DOMException('cancelled', 'AbortError');
+    tEl.textContent = extra ? 'saving…' : 'sending…';
     const res = await fetch(extra && extra.url || '/api/cutout', { method: 'POST', body, signal: ctrl.signal });
     if (!res.ok) throw new Error(await res.text());
     const blob = await res.blob();
@@ -830,7 +913,7 @@ async function run(src, opts, anchor, extra) {
     const del = card.querySelector('.del');
     del.hidden = false; del.onclick = () => card.remove();
   } finally {
-    busy--; working[opts.model]--; refreshStatus();
+    busy--; working[opts.model]--; delete JOBS[job]; refreshStatus();
   }
 }
 
@@ -1156,9 +1239,9 @@ window.addEventListener('keydown', e => {
 
 (async () => {
   await loadModels();
-  restoreSettings();
+  await restoreSettings();
   refreshStatus();
-  statusTimer = setInterval(refreshStatus, 3000);
+  statusTimer = setInterval(refreshStatus, 1500);
   loadHistory();
 })();
 </script>
@@ -1175,7 +1258,23 @@ def index():
 @app.get("/api/status")
 def api_status():
     return {"loaded": loaded_models(), "idle": STATE["idle"],
-            "ram_gb": round(rmbg.total_ram_gb())}
+            "ram_gb": round(rmbg.total_ram_gb()), "jobs": dict(JOBS)}
+
+
+@app.get("/api/settings")
+def api_settings():
+    return load_settings()
+
+
+@app.post("/api/settings")
+async def api_settings_set(request: Request):
+    data = await request.json()
+    s = load_settings()
+    for k in ("model", "bg", "tta"):
+        if k in data:
+            s[k] = data[k]
+    save_settings(s)
+    return s
 
 
 @app.get("/api/models")
@@ -1296,6 +1395,13 @@ def api_edit(source: str = Form(""), image: UploadFile = File(...), strokes: int
     return Response(png, media_type="image/png", headers=headers)
 
 
+@app.delete("/api/history")
+def api_history_clear():
+    for m in history_list():
+        shutil.rmtree(os.path.join(HISTORY_DIR, m["id"]), ignore_errors=True)
+    return {"deleted": "all"}
+
+
 @app.delete("/api/history/{hid}")
 def api_history_delete(hid: str):
     shutil.rmtree(history_dir(hid), ignore_errors=True)
@@ -1311,9 +1417,15 @@ def api_cutout(
     tta: str = Form(""),
     job: str = Form(""),           # client id, so /api/cancel can skip it
     points: str = Form(""),        # JSON [[x, y, label], ...]: keep only the clicked object
+    use_settings: str = Form(""),  # model/bg/tta from the page's settings (Quick Action)
 ):
     # sync endpoint on purpose: FastAPI runs it in a worker thread, so the
     # event loop keeps answering /api/status while the GPU is busy.
+    if use_settings:
+        s = load_settings()
+        model = s.get("model") if s.get("model") in rmbg.MODELS else model
+        bg = s.get("bg", "")
+        tta = "1" if s.get("tta") else ""
     if model not in rmbg.MODELS:
         return Response(f"unknown model {model!r}", status_code=400)
     if image is not None:
@@ -1329,25 +1441,33 @@ def api_cutout(
     pts = parse_points(points)
 
     t0 = time.time()
-    with GPU:
-        if job in CANCELLED:
-            return Response("cancelled", status_code=499)
-        touch(model)
-        net, size, device, half = rmbg.load_model(
-            model, rmbg.pick_device(STATE["device"]),
-            half=False if STATE["fp32"] else None)
-        size = STATE["size"] or size
-        if pts:
-            touch(sam.NAME)
-            try:
-                rgba, _ = sam.cutout_picked(src, pts, net, size, device, half=half,
-                                            tta=bool(tta), key=source or None)
-            except ValueError as e:
-                return Response(str(e), status_code=422)
-            touch(sam.NAME)
-        else:
-            rgba, _ = rmbg.cutout(src, net, size, device, half=half, tta=bool(tta))
-        touch(model)
+    try:
+        JOBS[job] = "queued"
+        with GPU:
+            if job in CANCELLED:
+                return Response("cancelled", status_code=499)
+            touch(model)
+            if model not in loaded_names():
+                JOBS[job] = "load" if repo_downloaded(rmbg.MODELS[model][0])[0] else "download"
+            net, size, device, half = rmbg.load_model(
+                model, rmbg.pick_device(STATE["device"]),
+                half=False if STATE["fp32"] else None)
+            size = STATE["size"] or size
+            if pts:
+                touch(sam.NAME)
+                JOBS[job] = "run" if sam.loaded() else "sam"
+                try:
+                    rgba, _ = sam.cutout_picked(src, pts, net, size, device, half=half,
+                                                tta=bool(tta), key=source or None)
+                except ValueError as e:
+                    return Response(str(e), status_code=422)
+                touch(sam.NAME)
+            else:
+                JOBS[job] = "run"
+                rgba, _ = rmbg.cutout(src, net, size, device, half=half, tta=bool(tta))
+            touch(model)
+    finally:
+        JOBS.pop(job, None)
 
     if bg:
         out = rmbg.flatten(rgba, rmbg.parse_background(bg))
