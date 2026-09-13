@@ -309,7 +309,7 @@ PAGE = r"""<!doctype html>
   .card {
     position: relative;
     background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
-    padding: 14px; display: grid; grid-template-columns: 1fr 1fr auto; gap: 14px;
+    padding: 14px; display: grid; grid-template-columns: 1fr 1fr; gap: 12px 14px;
     align-items: center;
   }
   .corner {
@@ -318,7 +318,6 @@ PAGE = r"""<!doctype html>
     font: 18px/24px inherit; cursor: pointer;
   }
   .corner:hover { background: var(--drop); color: #c0392b; }
-  @media (max-width: 720px) { .card { grid-template-columns: 1fr 1fr; } }
   .shot {
     aspect-ratio: 4 / 3; border-radius: 10px; overflow: hidden;
     display: grid; place-items: center; background: #00000010;
@@ -330,15 +329,15 @@ PAGE = r"""<!doctype html>
     background-size: 18px 18px; background-position: 0 0, 9px 9px;
   }
   .shot img { max-width: 100%; max-height: 100%; display: block; }
-  .meta { grid-column: 1 / -1; display: flex; justify-content: space-between;
-          font-size: 12px; color: var(--muted); }
-  .actions { display: flex; flex-direction: column; gap: 8px; width: 236px; }
-  .actions .row { display: flex; gap: 8px; }
-  .actions .row > * { flex: 1 1 0; min-width: 0; }
-  .actions .row > select { flex: 1.6 1 0; }
-  .actions button.ghost { padding: 7px 8px; font-size: 13px; }
-  .actions select { font-size: 12px; padding: 4px 4px; }
-  .actions button.cancel { width: 100%; }
+  /* card: meta line on top, before/after, then the actions in working order */
+  .meta { grid-column: 1 / -1; display: flex; justify-content: space-between; gap: 12px;
+          padding-right: 26px; font-size: 12px; color: var(--muted); }
+  .actions { grid-column: 1 / -1; display: flex; gap: 8px 18px; flex-wrap: wrap; align-items: center; }
+  .actions .grp { display: flex; gap: 8px; align-items: center; }
+  .actions .grp.end { margin-left: auto; }
+  .actions button.ghost { padding: 7px 12px; font-size: 13px; }
+  .actions button.go { padding: 7px 18px; font-size: 13px; }
+  .actions select { font-size: 12px; padding: 5px 6px; }
   button.go {
     font: inherit; border: 0; border-radius: 8px; padding: 8px 14px; cursor: pointer;
     background: var(--accent); color: var(--panel);
@@ -690,30 +689,30 @@ function cardEl(name, opts) {
   const card = document.createElement('div');
   card.className = 'card';
   card.innerHTML = `
-    <div class="shot"><img></div>
-    <div class="shot checker"><div class="spin"></div></div>
-    <div class="actions">
-      <div class="row">
-        <button class="go save" disabled title="download the PNG">Save</button>
-        <button class="ghost copy" disabled title="copy the PNG to the clipboard">Copy</button>
-      </div>
-      <div class="row">
-        <button class="ghost pickobj" disabled title="click on the object to keep, for photos with several things in them">Pick object</button>
-        <button class="ghost touchup" disabled title="brush: bring parts back or erase them by hand">Touch up</button>
-      </div>
-      <div class="row">
-        <select class="redo-model" title="model for Redo">${optionsHtml(opts.model)}</select>
-        <button class="ghost redo" disabled title="run this photo again with the model on the left">Redo</button>
-      </div>
-      <button class="ghost cancel">Cancel</button>
-    </div>
-    <button class="corner del" hidden title="delete this result">×</button>
     <div class="meta">
       <span>${esc(name)} · <span class="tag">${esc(LABEL[opts.model] || opts.model)}</span>` +
       `${opts.tta ? ' · extra pass' : ''}` +
       `${opts.points && opts.points.length ? ` · picked object (${opts.points.length} click${opts.points.length > 1 ? 's' : ''})` : ''}` +
       `${opts.edited ? ' · brush' : ''}</span>
       <span class="t">working…</span>
+    </div>
+    <button class="corner del" hidden title="delete this result">×</button>
+    <div class="shot"><img></div>
+    <div class="shot checker"><div class="spin"></div></div>
+    <div class="actions">
+      <div class="grp">
+        <select class="redo-model" title="model for Redo">${optionsHtml(opts.model)}</select>
+        <button class="ghost redo" disabled title="run this photo again with the model on the left">Redo</button>
+      </div>
+      <div class="grp">
+        <button class="ghost pickobj" disabled title="click on the object to keep, for photos with several things in them">Pick object</button>
+        <button class="ghost touchup" disabled title="brush: bring parts back or erase them by hand">Touch up</button>
+      </div>
+      <div class="grp end">
+        <button class="ghost cancel">Cancel</button>
+        <button class="ghost copy" disabled title="copy the PNG to the clipboard">Copy</button>
+        <button class="go save" disabled title="download the PNG">Save</button>
+      </div>
     </div>`;
   return card;
 }
