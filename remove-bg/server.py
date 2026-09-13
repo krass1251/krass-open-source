@@ -174,9 +174,16 @@ def history_meta(hid):
         return json.load(f)
 
 
-def history_save(raw, name, png, meta):
-    """Write original + cutout + meta; meta.json goes last so a half-written
-    entry is invisible to history_list()."""
+def png_bytes(image):
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def history_save(raw, name, png, meta, cut=None):
+    """Write original + result + meta; meta.json goes last so a half-written
+    entry is invisible to history_list(). `cut` is the transparent RGBA
+    cutout when `png` was flattened onto a background: the brush needs it."""
     hid = uuid.uuid4().hex
     d = os.path.join(HISTORY_DIR, hid)
     os.makedirs(d)
@@ -185,6 +192,9 @@ def history_save(raw, name, png, meta):
         f.write(raw)
     with open(os.path.join(d, "out.png"), "wb") as f:
         f.write(png)
+    if cut is not None:
+        with open(os.path.join(d, "cut.png"), "wb") as f:
+            f.write(cut)
     meta = dict(meta, id=hid, name=name, ext=ext, ts=time.time())
     with open(os.path.join(d, "meta.json"), "w") as f:
         json.dump(meta, f)
@@ -377,6 +387,28 @@ PAGE = r"""<!doctype html>
   #picker-img { max-width: 94vw; max-height: calc(100vh - 130px); display: block; user-select: none; }
   #picker-canvas { position: absolute; inset: 0; cursor: crosshair; }
   .pick-hint { font-size: 12px; color: #999; }
+
+  /* brush overlay: same frame as the picker, scrollable zoomable stage */
+  #brush {
+    position: fixed; inset: 0; z-index: 10; background: rgba(12, 12, 14, .96);
+    display: flex; flex-direction: column; align-items: center; gap: 12px;
+    padding: 16px 24px; color: #eee;
+  }
+  #brush[hidden] { display: none; }
+  #brush label { display: inline-flex; gap: 6px; align-items: center; font-size: 12px; color: #bbb; }
+  #brush input[type=range] { width: 90px; }
+  .br-wrap { position: relative; line-height: 0; }
+  .br-stage { overflow: auto; max-width: 94vw; max-height: calc(100vh - 130px); }
+  #br-work {
+    display: block; cursor: none;
+    background-image:
+      linear-gradient(45deg, #444 25%, transparent 25%, transparent 75%, #444 75%),
+      linear-gradient(45deg, #444 25%, #666 25%, #666 75%, #444 75%);
+    background-size: 20px 20px; background-position: 0 0, 10px 10px;
+  }
+  #br-work.white { background: #fff; }
+  #br-work.black { background: #000; }
+  #br-ring { position: absolute; inset: 0; pointer-events: none; }
 </style>
 </head>
 <body>
@@ -433,6 +465,36 @@ PAGE = r"""<!doctype html>
   </div>
   <div class="pick-stage"><img id="picker-img" draggable="false"><canvas id="picker-canvas"></canvas></div>
   <div class="pick-hint">click = keep · ⌥-click or right-click = exclude · ⌘Z undo · Enter applies · Esc closes</div>
+</div>
+
+<div id="brush" hidden>
+  <div class="pick-top">
+    <span id="br-msg">Paint over what to bring back or erase</span>
+    <span class="pick-tools">
+      <button class="ghost br-tool" data-mode="restore" aria-pressed="true" title="paint the original back (R)">Restore</button>
+      <button class="ghost br-tool" data-mode="erase" aria-pressed="false" title="make transparent (E)">Erase</button>
+      <label>size <input type="range" id="br-size" min="2" max="400" value="40"></label>
+      <label>soft <input type="range" id="br-soft" min="0" max="100" value="50"></label>
+      <button class="ghost" id="br-undo" disabled>Undo</button>
+      <button class="ghost" id="br-redo" disabled>Redo</button>
+      <button class="ghost" id="br-reset" disabled>Reset</button>
+    </span>
+    <span class="pick-tools">
+      <button class="ghost br-view" data-view="" aria-pressed="true" title="view on checkerboard">▦</button>
+      <button class="ghost br-view" data-view="white" aria-pressed="false" title="view on white">white</button>
+      <button class="ghost br-view" data-view="black" aria-pressed="false" title="view on black">black</button>
+      <button class="ghost" id="br-zoomout" title="zoom out">−</button>
+      <button class="ghost" id="br-zoomfit" title="fit to screen">fit</button>
+      <button class="ghost" id="br-zoomin" title="zoom in">+</button>
+      <button class="ghost" id="br-cancel">Cancel</button>
+      <button class="go" id="br-go" disabled>Apply changes</button>
+    </span>
+  </div>
+  <div class="br-wrap">
+    <div class="br-stage" id="br-stage"><canvas id="br-work"></canvas></div>
+    <canvas id="br-ring"></canvas>
+  </div>
+  <div class="pick-hint">drag to paint · [ ] brush size · X swaps Restore/Erase · ⌘Z undo, ⌘⇧Z redo · Enter applies · Esc closes</div>
 </div>
 
 <script>
@@ -619,13 +681,15 @@ function cardEl(name, opts) {
       <select class="redo-model" title="model for Redo">${optionsHtml(opts.model)}</select>
       <button class="ghost redo" disabled>Redo with this model</button>
       <button class="ghost pickobj" disabled title="click on the object to keep, for photos with several things in them">Pick object</button>
+      <button class="ghost touchup" disabled title="brush: bring parts back or erase them by hand">Touch up</button>
       <button class="ghost cancel">Cancel</button>
       <button class="ghost del" hidden>Delete</button>
     </div>
     <div class="meta">
       <span>${esc(name)} · <span class="tag">${esc(LABEL[opts.model] || opts.model)}</span>` +
       `${opts.tta ? ' · extra pass' : ''}` +
-      `${opts.points && opts.points.length ? ` · picked object (${opts.points.length} click${opts.points.length > 1 ? 's' : ''})` : ''}</span>
+      `${opts.points && opts.points.length ? ` · picked object (${opts.points.length} click${opts.points.length > 1 ? 's' : ''})` : ''}` +
+      `${opts.edited ? ' · brush' : ''}</span>
       <span class="t">working…</span>
     </div>`;
   return card;
@@ -683,6 +747,9 @@ function finish(card, src, opts, out) {
     pickBtn.disabled = false;
     pickBtn.onclick = () => openPicker({ id: out.id, name: src.name },
       { ...opts, model: card.querySelector('.redo-model').value }, card);
+    const tu = card.querySelector('.touchup');
+    tu.disabled = false;
+    tu.onclick = () => openBrush({ id: out.id, name: src.name }, opts, card);
   }
   card.querySelector('.del').onclick = async () => {
     if (out.id) await fetch(`/api/history/${out.id}`, { method: 'DELETE' });
@@ -690,7 +757,9 @@ function finish(card, src, opts, out) {
   };
 }
 
-async function run(src, opts, anchor) {
+// extra = {url, blob, strokes}: post a brush-edited PNG to /api/edit instead
+// of running the model; the card flow is the same.
+async function run(src, opts, anchor, extra) {
   const card = cardEl(src.name, opts);
   if (anchor) anchor.before(card); else cards.prepend(card);
   const [before, after] = card.querySelectorAll('.shot');
@@ -714,13 +783,14 @@ async function run(src, opts, anchor) {
   body.append('tta', opts.tta ? '1' : '');
   body.append('job', job);
   if (opts.points && opts.points.length) body.append('points', JSON.stringify(opts.points));
+  if (extra && extra.blob) { body.append('image', extra.blob, 'edit.png'); body.append('strokes', extra.strokes); }
 
   const t0 = performance.now();
   busy++; working[opts.model] = (working[opts.model] || 0) + 1; refreshStatus();
   try {
     await ensureAwake();
     if (ctrl.signal.aborted) throw new DOMException('cancelled', 'AbortError');
-    const res = await fetch('/api/cutout', { method: 'POST', body, signal: ctrl.signal });
+    const res = await fetch(extra && extra.url || '/api/cutout', { method: 'POST', body, signal: ctrl.signal });
     if (!res.ok) throw new Error(await res.text());
     const blob = await res.blob();
     finish(card, src, opts, {
@@ -746,7 +816,7 @@ async function loadHistory() {
   let h;
   try { h = await (await fetch('/api/history')).json(); } catch (e) { return; }
   for (const it of h.items) {           // oldest first; prepend puts newest on top
-    const opts = { model: it.model, bg: it.bg, tta: it.tta, points: it.points || [] };
+    const opts = { model: it.model, bg: it.bg, tta: it.tta, points: it.points || [], edited: !!it.edited };
     const card = cardEl(it.name, opts);
     cards.prepend(card);
     card.querySelector('.shot img').src = `/api/history/${it.id}/orig`;
@@ -878,6 +948,186 @@ window.addEventListener('keydown', e => {
   else if (e.key === 'z' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); pk.undo.click(); }
 });
 
+// ---- brush overlay. Works on the full-resolution cutout in a canvas:
+// Restore stamps the original's pixels back through a soft circle, Erase
+// cuts alpha with destination-out. Strokes are kept as data and replayed
+// from the untouched cutout for Undo, so no pixel snapshots pile up.
+const br = {
+  el: document.getElementById('brush'), stage: document.getElementById('br-stage'),
+  work: document.getElementById('br-work'), ring: document.getElementById('br-ring'),
+  msg: document.getElementById('br-msg'), go: document.getElementById('br-go'),
+  undo: document.getElementById('br-undo'), redo: document.getElementById('br-redo'),
+  reset: document.getElementById('br-reset'), sizeEl: document.getElementById('br-size'),
+  softEl: document.getElementById('br-soft'),
+  src: null, opts: null, anchor: null, base: null, orig: null,
+  strokes: [], undone: [], cur: null, mode: 'restore', zoom: 1, fit: 1,
+  tmp: document.createElement('canvas'), mouse: null,
+};
+
+async function loadImage(url) {
+  const img = new Image(); img.src = url; await img.decode(); return img;
+}
+async function openBrush(src, opts, anchor) {
+  Object.assign(br, { src, opts, anchor, strokes: [], undone: [], cur: null, mouse: null });
+  br.el.hidden = false;
+  br.msg.textContent = 'Loading…';
+  try {
+    const [cut, orig] = await Promise.all([
+      loadImage(`/api/history/${src.id}/cut`), loadImage(`/api/history/${src.id}/orig`)]);
+    br.base = cut;
+    br.orig = document.createElement('canvas');
+    br.orig.width = cut.naturalWidth; br.orig.height = cut.naturalHeight;
+    br.orig.getContext('2d').drawImage(orig, 0, 0, cut.naturalWidth, cut.naturalHeight);
+    br.work.width = cut.naturalWidth; br.work.height = cut.naturalHeight;
+    br.sizeEl.max = Math.max(50, Math.round(cut.naturalWidth / 4));
+    br.sizeEl.value = Math.max(8, Math.round(cut.naturalWidth / 40));
+    setZoom('fit');
+    replay();
+    br.msg.textContent = 'Paint over what to bring back or erase';
+  } catch (e) { br.msg.textContent = 'Failed: ' + e.message; }
+}
+function closeBrush() { br.el.hidden = true; br.base = br.orig = null; br.work.width = 1; }
+function brushButtons() {
+  br.undo.disabled = !br.strokes.length; br.redo.disabled = !br.undone.length;
+  br.reset.disabled = !br.strokes.length; br.go.disabled = !br.strokes.length;
+}
+function setZoom(z) {
+  const maxW = window.innerWidth * .94, maxH = window.innerHeight - 130;
+  br.fit = Math.min(1, maxW / br.work.width, maxH / br.work.height);
+  const steps = [br.fit, 1, 2, 4].filter((v, i, a) => a.indexOf(v) === i).sort((a, b) => a - b);
+  if (z === 'fit') br.zoom = br.fit;
+  else if (z === 'in') br.zoom = steps.find(s => s > br.zoom + 1e-6) || br.zoom;
+  else if (z === 'out') br.zoom = [...steps].reverse().find(s => s < br.zoom - 1e-6) || br.zoom;
+  br.work.style.width = (br.work.width * br.zoom) + 'px';
+  br.work.style.height = (br.work.height * br.zoom) + 'px';
+  requestAnimationFrame(() => {
+    const r = br.stage.getBoundingClientRect();
+    br.ring.width = r.width; br.ring.height = r.height;
+    br.ring.style.width = r.width + 'px'; br.ring.style.height = r.height + 'px';
+    drawRing();
+  });
+}
+function brushGrad(ctx, x, y, r, soft) {
+  const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+  g.addColorStop(0, 'rgba(0,0,0,1)');
+  g.addColorStop(Math.max(0, 1 - soft), 'rgba(0,0,0,1)');
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  return g;
+}
+function stamp(ctx, x, y, s) {
+  const r = s.size / 2;
+  if (s.mode === 'erase') {
+    ctx.globalCompositeOperation = 'destination-out';
+    ctx.fillStyle = brushGrad(ctx, x, y, r, s.soft);
+    ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill();
+    return;
+  }
+  const x0 = Math.floor(x - r) - 1, y0 = Math.floor(y - r) - 1, n = Math.ceil(r * 2) + 3;
+  const t = br.tmp; t.width = n; t.height = n;                  // resizing clears it
+  const tc = t.getContext('2d');
+  tc.fillStyle = brushGrad(tc, x - x0, y - y0, r, s.soft);
+  tc.beginPath(); tc.arc(x - x0, y - y0, r, 0, 7); tc.fill();
+  tc.globalCompositeOperation = 'source-in';
+  tc.drawImage(br.orig, x0, y0, n, n, 0, 0, n, n);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.drawImage(t, x0, y0);
+}
+function segment(ctx, a, b, s) {
+  const step = Math.max(1, s.size / 6);
+  const d = Math.hypot(b[0] - a[0], b[1] - a[1]), k = Math.max(1, Math.ceil(d / step));
+  for (let i = 1; i <= k; i++)
+    stamp(ctx, a[0] + (b[0] - a[0]) * i / k, a[1] + (b[1] - a[1]) * i / k, s);
+}
+function replay() {
+  const ctx = br.work.getContext('2d');
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.clearRect(0, 0, br.work.width, br.work.height);
+  ctx.drawImage(br.base, 0, 0);
+  for (const s of br.strokes) {
+    stamp(ctx, s.pts[0][0], s.pts[0][1], s);
+    for (let i = 1; i < s.pts.length; i++) segment(ctx, s.pts[i - 1], s.pts[i], s);
+  }
+  brushButtons();
+}
+function drawRing() {
+  const c = br.ring, ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, c.width, c.height);
+  if (!br.mouse) return;
+  const r = br.sizeEl.value * br.zoom / 2;
+  ctx.beginPath(); ctx.arc(br.mouse[0], br.mouse[1], r, 0, 7);
+  ctx.lineWidth = 1.5; ctx.strokeStyle = br.mode === 'erase' ? '#ff5252' : '#3ddc84'; ctx.stroke();
+  ctx.beginPath(); ctx.arc(br.mouse[0], br.mouse[1], r, 0, 7);
+  ctx.strokeStyle = 'rgba(0,0,0,.6)'; ctx.lineWidth = .5; ctx.stroke();
+}
+function brushPos(e) {
+  const r = br.work.getBoundingClientRect();
+  return [(e.clientX - r.left) / br.zoom, (e.clientY - r.top) / br.zoom];
+}
+br.work.addEventListener('pointerdown', e => {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  br.work.setPointerCapture(e.pointerId);
+  const p = brushPos(e);
+  br.cur = { mode: br.mode, size: +br.sizeEl.value, soft: br.softEl.value / 100, pts: [p] };
+  stamp(br.work.getContext('2d'), p[0], p[1], br.cur);
+});
+br.work.addEventListener('pointermove', e => {
+  if (!br.cur) return;
+  const p = brushPos(e), last = br.cur.pts[br.cur.pts.length - 1];
+  if (Math.hypot(p[0] - last[0], p[1] - last[1]) < 1) return;
+  segment(br.work.getContext('2d'), last, p, br.cur);
+  br.cur.pts.push(p);
+});
+function endStroke() {
+  if (!br.cur) return;
+  br.strokes.push(br.cur); br.undone = []; br.cur = null;
+  brushButtons();
+}
+br.work.addEventListener('pointerup', endStroke);
+br.work.addEventListener('pointercancel', endStroke);
+br.stage.addEventListener('pointermove', e => {
+  const r = br.stage.getBoundingClientRect();
+  br.mouse = [e.clientX - r.left, e.clientY - r.top]; drawRing();
+});
+br.stage.addEventListener('pointerleave', () => { br.mouse = null; drawRing(); });
+function setBrushMode(m) {
+  br.mode = m;
+  document.querySelectorAll('.br-tool').forEach(b => b.setAttribute('aria-pressed', b.dataset.mode === m));
+  drawRing();
+}
+document.querySelectorAll('.br-tool').forEach(b => b.addEventListener('click', () => setBrushMode(b.dataset.mode)));
+document.querySelectorAll('.br-view').forEach(b => b.addEventListener('click', () => {
+  br.work.className = b.dataset.view;
+  document.querySelectorAll('.br-view').forEach(v => v.setAttribute('aria-pressed', v === b));
+}));
+br.sizeEl.addEventListener('input', drawRing);
+br.undo.addEventListener('click', () => { if (br.strokes.length) { br.undone.push(br.strokes.pop()); replay(); } });
+br.redo.addEventListener('click', () => { if (br.undone.length) { br.strokes.push(br.undone.pop()); replay(); } });
+br.reset.addEventListener('click', () => { br.strokes = []; br.undone = []; replay(); });
+document.getElementById('br-zoomin').addEventListener('click', () => setZoom('in'));
+document.getElementById('br-zoomout').addEventListener('click', () => setZoom('out'));
+document.getElementById('br-zoomfit').addEventListener('click', () => setZoom('fit'));
+document.getElementById('br-cancel').addEventListener('click', closeBrush);
+br.go.addEventListener('click', async () => {
+  br.go.disabled = true; br.msg.textContent = 'Saving…';
+  const blob = await new Promise(r => br.work.toBlob(r, 'image/png'));
+  const { src, opts, anchor, strokes } = br;
+  closeBrush();
+  run(src, { ...opts, edited: true }, anchor, { url: '/api/edit', blob, strokes: strokes.length });
+});
+window.addEventListener('resize', () => { if (!br.el.hidden) setZoom(br.zoom === br.fit ? 'fit' : 'same'); });
+window.addEventListener('keydown', e => {
+  if (br.el.hidden) return;
+  if (e.key === 'Escape') closeBrush();
+  else if (e.key === 'Enter' && !br.go.disabled) br.go.click();
+  else if (e.key === 'z' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); (e.shiftKey ? br.redo : br.undo).click(); }
+  else if (e.key === '[') { br.sizeEl.value = Math.max(2, br.sizeEl.value / 1.25); drawRing(); }
+  else if (e.key === ']') { br.sizeEl.value = Math.min(br.sizeEl.max, br.sizeEl.value * 1.25); drawRing(); }
+  else if (e.key === 'x' || e.key === 'X') setBrushMode(br.mode === 'erase' ? 'restore' : 'erase');
+  else if (e.key === 'e' || e.key === 'E') setBrushMode('erase');
+  else if (e.key === 'r' || e.key === 'R') setBrushMode('restore');
+});
+
 (async () => {
   await loadModels();
   restoreSettings();
@@ -991,6 +1241,35 @@ def api_history_out(hid: str):
     return FileResponse(os.path.join(history_dir(hid), "out.png"))
 
 
+@app.get("/api/history/{hid}/cut")
+def api_history_cut(hid: str):
+    """The transparent cutout, even when the result was flattened onto a colour."""
+    d = history_dir(hid)
+    cut = os.path.join(d, "cut.png")
+    return FileResponse(cut if os.path.isfile(cut) else os.path.join(d, "out.png"))
+
+
+@app.post("/api/edit")
+def api_edit(source: str = Form(""), image: UploadFile = File(...), strokes: int = Form(0)):
+    """A cutout retouched with the brush in the browser: store it as a new
+    history entry next to its source (same original, background, model)."""
+    meta = history_meta(source)
+    rgba = Image.open(io.BytesIO(image.file.read())).convert("RGBA")
+    with open(os.path.join(history_dir(source), "orig" + meta["ext"]), "rb") as f:
+        raw = f.read()
+    bg = meta.get("bg", "")
+    out = rmbg.flatten(rgba, rmbg.parse_background(bg)) if bg else rgba
+    png = png_bytes(out)
+    headers = {}
+    if STATE["history_days"] > 0:
+        headers["X-Id"] = history_save(raw, meta["name"], png, {
+            "model": meta["model"], "bg": bg, "tta": meta.get("tta", False),
+            "points": meta.get("points", []), "edited": True, "strokes": strokes,
+            "seconds": 0, "width": rgba.width, "height": rgba.height},
+            cut=png_bytes(rgba) if bg else None)
+    return Response(png, media_type="image/png", headers=headers)
+
+
 @app.delete("/api/history/{hid}")
 def api_history_delete(hid: str):
     shutil.rmtree(history_dir(hid), ignore_errors=True)
@@ -1049,15 +1328,14 @@ def api_cutout(
     else:
         out = rgba
 
-    buf = io.BytesIO()
-    out.save(buf, format="PNG")
-    png = buf.getvalue()
+    png = png_bytes(out)
     headers = {"X-Seconds": f"{time.time() - t0:.2f}"}
     if STATE["history_days"] > 0 and job not in CANCELLED:
         headers["X-Id"] = history_save(raw, name, png, {
             "model": model, "bg": bg, "tta": bool(tta), "points": pts,
             "seconds": round(time.time() - t0, 2),
-            "width": src.width, "height": src.height})
+            "width": src.width, "height": src.height},
+            cut=png_bytes(rgba) if bg else None)
     return Response(png, media_type="image/png", headers=headers)
 
 

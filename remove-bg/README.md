@@ -69,6 +69,18 @@ used as is (coarser edges, but the right object). SAM runs on the CPU, ~1 s
 to read an image once and ~30 ms per click after that, and shows up in the
 memory line as `sam2` with the same idle unload as the other models.
 
+### Touch up: the brush
+
+When the model got a detail wrong, **Touch up** on a card opens the cutout
+large on a checkerboard (or white / black, to see the edges). **Restore**
+paints the original's pixels back, **Erase** makes them transparent; size and
+softness sliders, zoom to 1x/2x/4x with scrolling for hair, Undo / Redo /
+Reset. **Apply changes** makes a new card above the source, tagged `brush`.
+Keys: `[` `]` size, `X` swaps the tools, `⌘Z` / `⌘⇧Z`, Enter applies, Esc
+closes. Everything happens in the browser on the full-resolution image; no
+model runs. Results that were flattened onto a colour keep their transparent
+cutout on disk (`cut.png`), so the brush works on those too.
+
 ### History
 
 Every result is kept for 7 days in
