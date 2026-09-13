@@ -34,7 +34,7 @@ import sys
 import time
 
 import torch
-from PIL import Image, ImageColor
+from PIL import Image, ImageColor, ImageOps
 from torchvision import transforms
 
 try:  # iPhone photos are .heic, Pillow needs a plugin for those
@@ -165,6 +165,14 @@ def predict_alpha(image, net, size, device, half=False, tta=False):
     return transforms.ToPILImage()(alpha).resize(image.size, Image.LANCZOS)
 
 
+def open_rgb(source):
+    """Path or file object -> RGB image with the EXIF orientation applied.
+    Phone JPEGs store the pixels sideways plus a rotation tag; browsers and
+    Preview rotate on display, so the model must see the rotated pixels too,
+    or the cutout comes out sideways and clicks land on the wrong spot."""
+    return ImageOps.exif_transpose(Image.open(source)).convert("RGB")
+
+
 def unmix_foreground(image, alpha):
     """Estimate the true foreground colour so hair keeps no halo of the old
     background. Falls back to the raw pixels if pymatting is missing."""
@@ -286,7 +294,7 @@ def main():
 
     for path in files:
         t0 = time.time()
-        image = Image.open(path).convert("RGB")
+        image = open_rgb(path)
         rgba, alpha = cutout(image, net, size, device, half=half, tta=args.tta,
                              unmix=not args.no_unmix)
 

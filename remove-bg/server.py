@@ -16,14 +16,20 @@ Loading costs ~1-4 s, unloading ~0.3 s. The x on a model chip (POST
 
 History: each result (original + cutout + settings) is kept under
 ~/Library/Application Support/remove-bg/history for --history-days days
-(default 7, 0 keeps nothing on disk), so the page shows it again after a
+(default 7, 0 writes nothing new), so the page shows it again after a
 reload or a server restart, and Redo can rerun an old photo with another
 model. Delete on a card removes it from disk at once.
 
 Sleep: after --sleep-after minutes without an image (default 10, 0 = never)
 the process exec()s into sleeper.py on the same port: the idle torch runtime
-alone is ~1 GB, the sleeper ~15 MB. Status polling from an open tab does not
-count as work, so tabs can stay open forever. The page (or serve.sh, or a
+alone is ~1 GB, the sleeper ~15 MB. Any request except status polling counts
+as work (a reload, the picker, the brush), and the swap waits for requests in
+flight, so an open tab can stay open forever and never loses a request.
+
+Only the page on this machine may talk to the API: Host must be loopback and
+Origin, when a browser sends one, must match it. Without that any web page
+in the browser could POST /api/quit or queue GPU work (simple form posts
+skip the CORS preflight), and a DNS-rebound name could read the history. The page (or serve.sh, or a
 fresh GET /) wakes it with POST /api/wake; the first image after that waits
 ~3 s for the import plus the usual model load. "Quit" (POST /api/quit)
 stops the server for good, for the app-launched case with no terminal.
@@ -38,11 +44,13 @@ import shutil
 import sys
 import threading
 import time
+import traceback
 import uuid
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, Response
-from PIL import Image
+from PIL import Image, ImageColor
 
 import rmbg
 import sam
@@ -51,8 +59,11 @@ app = FastAPI(title="remove-bg (local)")
 
 STATE = {"device": "auto", "fp32": False, "idle": 60, "last_used": {},
          "size": None, "history_days": 7, "sleep_after": 10,
-         "last_work": time.time()}
+         "last_work": time.time(), "host": "127.0.0.1"}
 GPU = threading.Lock()   # one inference at a time; also guards load/unload
+INFLIGHT = [0]           # requests being served right now; sleep waits for zero
+INFLIGHT_LOCK = threading.Lock()
+LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 CANCELLED = {}           # job id -> time the client gave up on it
 JOBS = {}                # job id -> stage, for the card's status line
 
@@ -64,9 +75,52 @@ def load_settings():
     and the Finder Quick Action both follow them."""
     try:
         with open(SETTINGS_PATH) as f:
-            return json.load(f)
+            s = json.load(f)
+        return s if isinstance(s, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+def parse_bg(value):
+    """Background from the page or settings.json -> RGB tuple, None for
+    transparent. Colours only (the CLI's parse_background also takes file
+    paths, which a web request must not), and a bad value is a 400 before
+    any model has run."""
+    if not value:
+        return None
+    try:
+        return ImageColor.getrgb(str(value))[:3]
+    except ValueError:
+        raise HTTPException(400, f"unknown background colour {value!r}")
+
+
+def local_request(request):
+    """Host must be loopback (unless --host opened the server up on purpose)
+    and Origin, when the browser sends one, must be the same host."""
+    try:
+        host = urlsplit("//" + request.headers.get("host", "")).hostname or ""
+        origin = request.headers.get("origin")
+        origin_host = urlsplit(origin).hostname or "" if origin else host
+    except ValueError:
+        return False
+    if STATE["host"] not in ("0.0.0.0", "::") and host not in LOCAL_HOSTS:
+        return False
+    return origin_host == host
+
+
+@app.middleware("http")
+async def guard(request: Request, call_next):
+    if not local_request(request):
+        return Response("forbidden: not a local request", status_code=403)
+    with INFLIGHT_LOCK:
+        INFLIGHT[0] += 1
+    try:
+        if request.url.path != "/api/status":
+            STATE["last_work"] = time.time()
+        return await call_next(request)
+    finally:
+        with INFLIGHT_LOCK:
+            INFLIGHT[0] -= 1
 
 
 def save_settings(d):
@@ -140,41 +194,55 @@ def repo_downloaded(repo):
     snaps = os.path.join(d, "snapshots")
     if not os.path.isdir(snaps):
         return False, 0
-    weights = any(f.endswith(".safetensors")
-                  for s in os.listdir(snaps)
-                  for f in os.listdir(os.path.join(snaps, s)))
-    blobs = os.path.join(d, "blobs")
-    total = sum(os.path.getsize(os.path.join(blobs, f))
-                for f in os.listdir(blobs)) if os.path.isdir(blobs) else 0
+    try:   # a .DS_Store in snapshots/ or a vanished blob must not take the UI down
+        weights = any(f.endswith(".safetensors")
+                      for s in os.listdir(snaps)
+                      if os.path.isdir(os.path.join(snaps, s))
+                      for f in os.listdir(os.path.join(snaps, s)))
+        blobs = os.path.join(d, "blobs")
+        total = sum(os.path.getsize(os.path.join(blobs, f))
+                    for f in os.listdir(blobs)
+                    if os.path.isfile(os.path.join(blobs, f))) if os.path.isdir(blobs) else 0
+    except OSError:
+        return False, 0
     return weights, total // 2**20
 
 
-def idle_reaper():
-    """Background thread: unload each model once it sat unused for --idle s."""
+def forever(step, every):
+    """Background thread: step() every `every` seconds. An exception is
+    printed and the loop goes on; a dead reaper would silently leave models
+    in memory, the server awake or the history unpurged."""
     while True:
-        time.sleep(2)
-        if STATE["idle"] <= 0:
-            continue
-        for model in loaded_names():
-            if idle_for(model) < STATE["idle"]:
-                continue
-            with GPU:
-                if model in loaded_names() and idle_for(model) >= STATE["idle"]:
-                    unload_one(model)
-                    print(f"{model} unloaded after idle", flush=True)
+        time.sleep(every)
+        try:
+            step()
+        except Exception:
+            traceback.print_exc()
 
 
-def sleep_reaper():
-    """Background thread: after --sleep-after minutes without an image,
-    become sleeper.py (same PID, same port, ~15 MB instead of ~1 GB)."""
-    while True:
-        time.sleep(15)
-        mins = STATE["sleep_after"]
-        if mins <= 0 or GPU.locked():
+def idle_step():
+    """Unload each model once it sat unused for --idle s."""
+    if STATE["idle"] <= 0:
+        return
+    for model in loaded_names():
+        if idle_for(model) < STATE["idle"]:
             continue
-        if time.time() - STATE["last_work"] >= mins * 60:
-            print(f"no work for {mins} min, going to sleep", flush=True)
-            os.execv(sys.executable, [sys.executable, SLEEPER, *sys.argv[1:]])
+        with GPU:
+            if model in loaded_names() and idle_for(model) >= STATE["idle"]:
+                unload_one(model)
+                print(f"{model} unloaded after idle", flush=True)
+
+
+def sleep_step():
+    """After --sleep-after minutes without work, become sleeper.py (same
+    PID, same port, ~15 MB instead of ~1 GB). Never while a request is
+    being served: exec() would cut it off mid-flight."""
+    mins = STATE["sleep_after"]
+    if mins <= 0 or GPU.locked() or INFLIGHT[0]:
+        return
+    if time.time() - STATE["last_work"] >= mins * 60:
+        print(f"no work for {mins} min, going to sleep", flush=True)
+        os.execv(sys.executable, [sys.executable, SLEEPER, *sys.argv[1:]])
 
 
 # ----------------------------------------------------------------- history
@@ -228,9 +296,11 @@ def history_list():
     for hid in os.listdir(HISTORY_DIR):
         try:
             with open(os.path.join(HISTORY_DIR, hid, "meta.json")) as f:
-                items.append(json.load(f))
+                m = json.load(f)
         except (OSError, ValueError):
             continue
+        if isinstance(m, dict) and m.get("id") == hid and "ts" in m:
+            items.append(m)
     items.sort(key=lambda m: m["ts"])
     return items
 
@@ -252,17 +322,20 @@ def parse_points(points):
 
 
 def history_purge():
+    """Drop entries older than --history-days. 0 means nothing new is
+    written; what earlier runs left on disk stays until deleted on the page,
+    a flag flip must not wipe a week of results."""
     days = STATE["history_days"]
+    if days <= 0:
+        return
     cutoff = time.time() - days * 86400
     for m in history_list():
-        if days <= 0 or m["ts"] < cutoff:
+        if m["ts"] < cutoff:
             shutil.rmtree(os.path.join(HISTORY_DIR, m["id"]), ignore_errors=True)
 
 
-def purge_reaper():
-    while True:
-        time.sleep(3600)
-        history_purge()
+def purge_step():
+    history_purge()
 
 
 PAGE = r"""<!doctype html>
@@ -577,8 +650,12 @@ function esc(s) {
 // ---- settings (model, background, extra pass) live on the server, so the
 // Finder Quick Action follows them too
 function saveSettings() {
-  fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: modelSel.value, bg, tta: ttaBox.checked }) }).catch(() => {});
+  const body = JSON.stringify({ model: modelSel.value, bg, tta: ttaBox.checked });
+  // the sleeper answers 503 and forgets, so wake the server first
+  ensureAwake()
+    .then(() => fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body }))
+    .then(async r => { if (!r.ok) throw new Error(await r.text()); })
+    .catch(e => { stat.textContent = 'settings not saved: ' + e.message; });
 }
 function setBg(v) {
   bg = v;
@@ -834,12 +911,18 @@ function softDelete(list) {
   trash.el.hidden = false;
   updateHead();
 }
-function commitDeletes() {
-  for (const c of trash.cards) {
-    if (c.dataset.id) fetch(`/api/history/${c.dataset.id}`, { method: 'DELETE', keepalive: true }).catch(() => {});
-    c.remove();
-  }
+async function commitDeletes(leaving) {
+  const list = trash.cards;
   trash.cards = []; trash.el.hidden = true;
+  // the sleeper answers 503 and forgets; wake the server unless the tab is
+  // closing, where there is no time to wait for it
+  if (!leaving) { try { await ensureAwake(); } catch (e) {} }
+  for (const c of list) {
+    if (!c.dataset.id) { c.remove(); continue; }
+    fetch(`/api/history/${c.dataset.id}`, { method: 'DELETE', keepalive: true })
+      .then(r => { if (r.ok || r.status === 404) c.remove(); else throw new Error(r.status); })
+      .catch(() => { c.hidden = false; updateHead(); });   // not deleted: show it again
+  }
 }
 document.getElementById('undo-del').addEventListener('click', () => {
   clearTimeout(trash.timer);
@@ -847,7 +930,7 @@ document.getElementById('undo-del').addEventListener('click', () => {
   trash.cards = []; trash.el.hidden = true;
   updateHead();
 });
-window.addEventListener('pagehide', () => { if (trash.cards.length) commitDeletes(); });
+window.addEventListener('pagehide', () => { if (trash.cards.length) commitDeletes(true); });
 document.getElementById('clear').addEventListener('click', () => {
   const done = [...cards.querySelectorAll('.card:not([hidden])')].filter(c => c.querySelector('.cancel').hidden);
   if (done.length) softDelete(done);
@@ -860,7 +943,7 @@ function updateHead() {
 new MutationObserver(updateHead).observe(cards, { childList: true });
 
 // extra = {url, blob, strokes}: post a brush-edited PNG to /api/edit instead
-// of running the model; the card flow is the same.
+// of running the model; the card flow is the same. Resolves true on success.
 async function run(src, opts, anchor, extra) {
   const card = cardEl(src.name, opts);
   if (anchor) anchor.before(card); else cards.prepend(card);
@@ -903,15 +986,17 @@ async function run(src, opts, anchor, extra) {
       seconds: (performance.now() - t0) / 1000,
     });
     const m = MODELS.find(x => x.name === opts.model);
-    if (m && !m.downloaded) loadModels();   // first use just fetched the weights
+    if (m && !m.downloaded) loadModels().catch(() => {});   // first use just fetched the weights
+    return true;
   } catch (err) {
-    if (err.name === 'AbortError') { card.remove(); return; }
+    if (err.name === 'AbortError') { card.remove(); return false; }
     after.innerHTML = '<div class="err"></div>';
     after.querySelector('.err').textContent = err.message;
     card.querySelector('.t').textContent = 'failed';
     card.querySelector('.cancel').hidden = true;
     const del = card.querySelector('.del');
     del.hidden = false; del.onclick = () => card.remove();
+    return false;
   } finally {
     busy--; working[opts.model]--; delete JOBS[job]; refreshStatus();
   }
@@ -941,10 +1026,14 @@ const pk = {
   src: null, opts: null, anchor: null, points: [], mask: null, label: 1, seq: 0,
 };
 
-function openPicker(src, opts, anchor) {
+async function openPicker(src, opts, anchor) {
   Object.assign(pk, { src, opts, anchor, points: [], mask: null, seq: pk.seq + 1 });
-  pk.img.src = `/api/history/${src.id}/orig`;
   pk.el.hidden = false;
+  pk.msg.textContent = 'Loading…';
+  try { await ensureAwake(); }      // asleep, the sleeper would serve a 503 instead of the photo
+  catch (e) { pk.msg.textContent = 'Failed: ' + e.message; return; }
+  if (pk.el.hidden) return;         // closed while waking
+  pk.img.src = `/api/history/${src.id}/orig`;
   const sam = MODELS.sam || {};
   pk.msg.textContent = 'Click the object you want to keep';
   document.querySelector('.pick-hint').textContent = (sam.downloaded ? '' :
@@ -1050,7 +1139,7 @@ window.addEventListener('keydown', e => {
   if (pk.el.hidden) return;
   if (e.key === 'Escape') closePicker();
   else if (e.key === 'Enter' && !pk.go.disabled) pk.go.click();
-  else if (e.key === 'z' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); pk.undo.click(); }
+  else if (e.key.toLowerCase() === 'z' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); pk.undo.click(); }
 });
 
 // ---- brush overlay. Works on the full-resolution cutout in a canvas:
@@ -1077,6 +1166,8 @@ async function openBrush(src, opts, anchor) {
   br.el.hidden = false;
   br.msg.textContent = 'Loading…';
   try {
+    await ensureAwake();            // asleep, the sleeper would serve a 503 instead of the images
+    if (br.el.hidden) return;       // closed while waking
     const [cut, orig] = await Promise.all([
       loadImage(`/api/history/${src.id}/cut`), loadImage(`/api/history/${src.id}/orig`)]);
     br.base = cut;
@@ -1220,16 +1311,18 @@ br.go.addEventListener('click', async () => {
   br.go.disabled = true; br.msg.textContent = 'Saving…';
   const blob = await new Promise(r => br.work.toBlob(r, 'image/png'));
   const { src, opts, anchor, strokes } = br;
-  br.strokes = [];            // applied, nothing to discard
-  closeBrush();
-  run(src, { ...opts, edited: true }, anchor, { url: '/api/edit', blob, strokes: strokes.length });
+  // the overlay stays open until the save succeeded: a failed upload must
+  // not throw the painting away
+  const ok = await run(src, { ...opts, edited: true }, anchor, { url: '/api/edit', blob, strokes: strokes.length });
+  if (ok) { br.strokes = []; closeBrush(); }          // applied, nothing to discard
+  else { br.msg.textContent = 'Saving failed (the card behind says why); the strokes are kept, try again'; brushButtons(); }
 });
 window.addEventListener('resize', () => { if (!br.el.hidden) setZoom(br.zoom === br.fit ? 'fit' : 'same'); });
 window.addEventListener('keydown', e => {
   if (br.el.hidden) return;
   if (e.key === 'Escape') closeBrush();
   else if (e.key === 'Enter' && !br.go.disabled) br.go.click();
-  else if (e.key === 'z' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); (e.shiftKey ? br.redo : br.undo).click(); }
+  else if (e.key.toLowerCase() === 'z' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); (e.shiftKey ? br.redo : br.undo).click(); }
   else if (e.key === '[') { br.sizeEl.value = Math.max(2, br.sizeEl.value / 1.25); drawRing(); }
   else if (e.key === ']') { br.sizeEl.value = Math.min(br.sizeEl.max, br.sizeEl.value * 1.25); drawRing(); }
   else if (e.key === 'x' || e.key === 'X') setBrushMode(br.mode === 'erase' ? 'restore' : 'erase');
@@ -1238,7 +1331,8 @@ window.addEventListener('keydown', e => {
 });
 
 (async () => {
-  await loadModels();
+  try { await loadModels(); }
+  catch (e) { hint.textContent = 'model list failed: ' + e.message; }
   await restoreSettings();
   refreshStatus();
   statusTimer = setInterval(refreshStatus, 1500);
@@ -1269,10 +1363,18 @@ def api_settings():
 @app.post("/api/settings")
 async def api_settings_set(request: Request):
     data = await request.json()
+    if not isinstance(data, dict):
+        raise HTTPException(400, "settings must be a JSON object")
     s = load_settings()
-    for k in ("model", "bg", "tta"):
-        if k in data:
-            s[k] = data[k]
+    if "model" in data:
+        if data["model"] not in rmbg.MODELS:
+            raise HTTPException(400, f"unknown model {data['model']!r}")
+        s["model"] = data["model"]
+    if "bg" in data:
+        parse_bg(data["bg"])
+        s["bg"] = str(data["bg"] or "")
+    if "tta" in data:
+        s["tta"] = bool(data["tta"])
     save_settings(s)
     return s
 
@@ -1312,7 +1414,7 @@ def api_sam(source: str = Form(""), points: str = Form("")):
     if not pts:
         return Response("no points", status_code=400)
     meta = history_meta(source)
-    image = Image.open(os.path.join(history_dir(source), "orig" + meta["ext"])).convert("RGB")
+    image = rmbg.open_rgb(os.path.join(history_dir(source), "orig" + meta["ext"]))
     touch(sam.NAME)
     logits = sam.segment(image, pts, key=source)
     touch(sam.NAME)
@@ -1357,7 +1459,7 @@ def api_history_orig(hid: str):
         return FileResponse(path)
     preview = os.path.join(d, "preview.jpg")   # heic & co: browsers cannot show them
     if not os.path.isfile(preview):
-        Image.open(path).convert("RGB").save(preview, quality=88)
+        rmbg.open_rgb(path).save(preview, quality=88)
     return FileResponse(preview)
 
 
@@ -1379,11 +1481,12 @@ def api_edit(source: str = Form(""), image: UploadFile = File(...), strokes: int
     """A cutout retouched with the brush in the browser: store it as a new
     history entry next to its source (same original, background, model)."""
     meta = history_meta(source)
+    bg = str(meta.get("bg") or "")
+    background = parse_bg(bg)
     rgba = Image.open(io.BytesIO(image.file.read())).convert("RGBA")
     with open(os.path.join(history_dir(source), "orig" + meta["ext"]), "rb") as f:
         raw = f.read()
-    bg = meta.get("bg", "")
-    out = rmbg.flatten(rgba, rmbg.parse_background(bg)) if bg else rgba
+    out = rmbg.flatten(rgba, background) if background else rgba
     png = png_bytes(out)
     headers = {}
     if STATE["history_days"] > 0:
@@ -1424,10 +1527,11 @@ def api_cutout(
     if use_settings:
         s = load_settings()
         model = s.get("model") if s.get("model") in rmbg.MODELS else model
-        bg = s.get("bg", "")
+        bg = str(s.get("bg") or "")
         tta = "1" if s.get("tta") else ""
     if model not in rmbg.MODELS:
         return Response(f"unknown model {model!r}", status_code=400)
+    background = parse_bg(bg)      # a bad colour fails here, not after the GPU run
     if image is not None:
         raw, name = image.file.read(), image.filename or "image"
     elif source:
@@ -1437,7 +1541,10 @@ def api_cutout(
             raw = f.read()
     else:
         return Response("no image", status_code=400)
-    src = Image.open(io.BytesIO(raw)).convert("RGB")
+    try:
+        src = rmbg.open_rgb(io.BytesIO(raw))
+    except Exception:
+        return Response("not an image", status_code=400)
     pts = parse_points(points)
 
     t0 = time.time()
@@ -1469,10 +1576,7 @@ def api_cutout(
     finally:
         JOBS.pop(job, None)
 
-    if bg:
-        out = rmbg.flatten(rgba, rmbg.parse_background(bg))
-    else:
-        out = rgba
+    out = rmbg.flatten(rgba, background) if background else rgba
 
     png = png_bytes(out)
     headers = {"X-Seconds": f"{time.time() - t0:.2f}"}
@@ -1499,7 +1603,7 @@ def main():
                     help="swap to the ~15 MB sleeper.py after this many minutes "
                          "without an image, 0 = never")
     ap.add_argument("--history-days", type=int, default=7,
-                    help="keep results on disk this long, 0 = keep nothing")
+                    help="keep results on disk this long, 0 = write nothing new")
     ap.add_argument("--no-warmup", action="store_true",
                     help="do not load the model at startup, wait for the first image")
     ap.add_argument("--device", default="auto")
@@ -1508,7 +1612,7 @@ def main():
 
     STATE.update(device=args.device, fp32=args.fp32, idle=args.idle, size=args.size,
                  sleep_after=args.sleep_after, history_days=args.history_days,
-                 last_work=time.time())
+                 last_work=time.time(), host=args.host)
     history_purge()
     if not args.no_warmup:
         print(f"warming up {rmbg.MODELS[args.model][0]} ...", flush=True)
@@ -1518,8 +1622,8 @@ def main():
     for m in loaded_models():
         print(f"{m['model']}: {m['precision']} at {m['size']}px on {m['device']}, "
               f"{rmbg.total_ram_gb():.0f} GB RAM, idle unload after {args.idle}s")
-    for fn in (idle_reaper, sleep_reaper, purge_reaper):
-        threading.Thread(target=fn, daemon=True).start()
+    for step, every in ((idle_step, 2), (sleep_step, 15), (purge_step, 3600)):
+        threading.Thread(target=forever, args=(step, every), daemon=True).start()
     print(f"\n  open  http://{args.host}:{args.port}\n", flush=True)
 
     import uvicorn

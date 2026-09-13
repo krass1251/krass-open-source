@@ -47,6 +47,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def local(self):
+        """Same rule as server.py: only the page on this machine may talk to
+        us, so a web page in the browser cannot quit or wake the server."""
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            return False
+        origin = self.headers.get("Origin")
+        if origin:
+            o = origin.split("//", 1)[-1].rsplit(":", 1)[0].strip("[]")
+            if o != host:
+                return False
+        return True
+
     def reply(self, code, body, ctype="application/json"):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
@@ -56,7 +69,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def do_GET(self):
-        if self.path.startswith("/api/status"):
+        if not self.local():
+            self.reply(403, b'{"error": "not a local request"}')
+        elif self.path.startswith("/api/status"):
             self.reply(200, json.dumps({"sleeping": True}).encode())
         elif self.path == "/":
             self.reply(200, WAKE_PAGE, "text/html; charset=utf-8")
@@ -64,7 +79,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply(503, b'{"sleeping": true}')
 
     def do_POST(self):
-        if self.path.startswith("/api/wake"):
+        if not self.local():
+            self.reply(403, b'{"error": "not a local request"}')
+        elif self.path.startswith("/api/wake"):
             self.reply(200, b'{"waking": true}')
             threading.Timer(0.2, wake).start()   # after the response is out
         elif self.path.startswith("/api/quit"):

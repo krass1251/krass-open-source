@@ -94,8 +94,8 @@ page shows the same cards after a reload or a server restart, and **Redo**
 still works on them. The × in a card's corner deletes it, **Clear all** above
 the cards deletes every finished result; both show a toast with **Undo** for
 5 seconds before anything is removed from disk.
-`--history-days 30` keeps them longer, `--history-days 0` writes nothing to
-disk. Note that big photos make big PNGs: check the folder size if disk space
+`--history-days 30` keeps them longer, `--history-days 0` writes nothing new
+to disk (what is already there stays until deleted on the page). Note that big photos make big PNGs: check the folder size if disk space
 is tight.
 
 ### As a Mac app, no terminal
@@ -144,7 +144,7 @@ Saved files carry the model name, `photo.hr-matting.cutout.png`.
 ./run-ui.sh --idle 300        # keep the model 5 min after the last image
 ./run-ui.sh --no-warmup       # start instantly, load on the first image
 ./run-ui.sh -s 2048           # force a resolution
-./run-ui.sh --history-days 0  # keep nothing on disk
+./run-ui.sh --history-days 0  # write nothing new to disk
 ./run-ui.sh --sleep-after 0   # never swap to the sleeper
 ```
 
