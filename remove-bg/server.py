@@ -536,8 +536,14 @@ PAGE = r"""<!doctype html>
       linear-gradient(45deg, #444 25%, #666 25%, #666 75%, #444 75%);
     background-size: 20px 20px; background-position: 0 0, 10px 10px;
   }
-  #ed-work.white { background: #fff; }
-  #ed-work.black { background: #000; }
+  /* the backdrop is a div: Chrome does not repaint a canvas's own CSS
+     background when its class changes, so white/black stuck */
+  #ed-back { position: absolute; inset: 0; pointer-events: none; }
+  #ed-back[hidden] { display: none; }
+  #ed-back.white { background: #fff; }
+  #ed-back.black { background: #000; }
+  .ed-row { display: flex; gap: 6px; align-items: center; width: 100%; }
+  #ed-zoomval { font-size: 12px; color: #bbb; margin-left: 4px; font-variant-numeric: tabular-nums; }
   #ed-handle {
     position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px;
     background: #fff; cursor: ew-resize; touch-action: none;
@@ -630,15 +636,22 @@ PAGE = r"""<!doctype html>
     </div>
     <div class="ed-sec">
       <h3>View</h3>
-      <button class="ghost ed-view" data-view="orig" aria-pressed="false" title="the original (1)">Original</button>
-      <button class="ghost ed-view" data-view="result" aria-pressed="true" title="the cutout (2)">Result</button>
-      <button class="ghost ed-view" data-view="compare" aria-pressed="false" title="drag the slider (3)">Compare</button>
-      <button class="ghost ed-bd" data-bd="" aria-pressed="true" title="on a checkerboard">▦</button>
-      <button class="ghost ed-bd" data-bd="white" aria-pressed="false" title="on white">white</button>
-      <button class="ghost ed-bd" data-bd="black" aria-pressed="false" title="on black">black</button>
-      <button class="ghost" id="ed-zoomout" title="zoom out">−</button>
-      <button class="ghost" id="ed-zoomfit" title="fit to the stage">fit</button>
-      <button class="ghost" id="ed-zoomin" title="zoom in">+</button>
+      <div class="ed-row">
+        <button class="ghost ed-view" data-view="orig" aria-pressed="false" title="the original (1)">Original</button>
+        <button class="ghost ed-view" data-view="result" aria-pressed="true" title="the cutout (2)">Result</button>
+        <button class="ghost ed-view" data-view="compare" aria-pressed="false" title="drag the slider (3)">Compare</button>
+      </div>
+      <div class="ed-row">
+        <button class="ghost ed-bd" data-bd="" aria-pressed="true" title="on a checkerboard">▦</button>
+        <button class="ghost ed-bd" data-bd="white" aria-pressed="false" title="on white">white</button>
+        <button class="ghost ed-bd" data-bd="black" aria-pressed="false" title="on black">black</button>
+      </div>
+      <div class="ed-row">
+        <button class="ghost" id="ed-zoomout" title="zoom out">−</button>
+        <button class="ghost" id="ed-zoomfit" title="fit to the stage">fit</button>
+        <button class="ghost" id="ed-zoomin" title="zoom in (or pinch the trackpad)">+</button>
+        <span id="ed-zoomval"></span>
+      </div>
     </div>
     <div class="ed-sec">
       <h3>Generate</h3>
@@ -661,7 +674,8 @@ PAGE = r"""<!doctype html>
     <div class="ed-stage" id="ed-stage">
       <div class="ed-wrap" id="ed-wrap">
         <canvas id="ed-orig" hidden></canvas>
-        <canvas id="ed-work" class="checkers"></canvas>
+        <div id="ed-back" class="checkers"></div>
+        <canvas id="ed-work"></canvas>
         <canvas id="ed-mask"></canvas>
         <div id="ed-handle" hidden></div>
       </div>
@@ -1075,6 +1089,7 @@ const ed = {
   el: document.getElementById('editor'), stage: document.getElementById('ed-stage'),
   wrap: document.getElementById('ed-wrap'), msg: document.getElementById('ed-msg'),
   orig: document.getElementById('ed-orig'), work: document.getElementById('ed-work'),
+  back: document.getElementById('ed-back'), zoomVal: document.getElementById('ed-zoomval'),
   maskC: document.getElementById('ed-mask'), ring: document.getElementById('ed-ring'),
   handle: document.getElementById('ed-handle'), hint: document.getElementById('ed-hint'),
   done: document.getElementById('ed-done'), gen: document.getElementById('ed-gen'),
@@ -1411,25 +1426,37 @@ function setView(v) {
   ed.view = v;
   press('ed-view', 'view', v);
   ed.orig.hidden = v === 'result';
-  ed.work.hidden = v === 'orig';
+  ed.work.hidden = ed.back.hidden = v === 'orig';
   ed.handle.hidden = v !== 'compare';
   setCompare(ed.compare);
 }
 function setCompare(p) {   // original on the left of the handle, result on the right
   ed.compare = Math.min(100, Math.max(0, p));
-  ed.work.style.clipPath = ed.view === 'compare' ? `inset(0 0 0 ${ed.compare}%)` : '';
+  ed.work.style.clipPath = ed.back.style.clipPath =
+    ed.view === 'compare' ? `inset(0 0 0 ${ed.compare}%)` : '';
   ed.handle.style.left = ed.compare + '%';
 }
-function setBd(v) { ed.bd = v; ed.work.className = 'checkers ' + v; press('ed-bd', 'bd', v); }
-function setZoom(z) {
+function setBd(v) { ed.bd = v; ed.back.className = 'checkers ' + v; press('ed-bd', 'bd', v); }
+// z: 'fit' | 'in' | 'out' | 'same' | a number; `at` is the client point that
+// stays under the cursor (a pinch), the middle of the stage otherwise
+function setZoom(z, at) {
   if (!ed.W) return;
   ed.fit = Math.min(1, (ed.stage.clientWidth - 8) / ed.W, (ed.stage.clientHeight - 8) / ed.H);
   const steps = [ed.fit, 1, 2, 4].filter((v, i, a) => a.indexOf(v) === i).sort((a, b) => a - b);
+  const old = ed.zoom, w0 = ed.wrap.getBoundingClientRect(), s = ed.stage.getBoundingClientRect();
+  if (!at) at = [s.left + s.width / 2, s.top + s.height / 2];
   if (z === 'fit') ed.zoom = ed.fit;
   else if (z === 'in') ed.zoom = steps.find(s => s > ed.zoom + 1e-6) || ed.zoom;
   else if (z === 'out') ed.zoom = [...steps].reverse().find(s => s < ed.zoom - 1e-6) || ed.zoom;
+  else if (typeof z === 'number') ed.zoom = Math.min(8, Math.max(ed.fit / 2, z));
   ed.wrap.style.width = (ed.W * ed.zoom) + 'px';
   ed.wrap.style.height = (ed.H * ed.zoom) + 'px';
+  if (w0.width) {   // keep the image point under `at` where it was
+    const ix = (at[0] - w0.left) / old, iy = (at[1] - w0.top) / old, w1 = ed.wrap.getBoundingClientRect();
+    ed.stage.scrollLeft += w1.left + ix * ed.zoom - at[0];
+    ed.stage.scrollTop += w1.top + iy * ed.zoom - at[1];
+  }
+  ed.zoomVal.textContent = Math.round(ed.zoom * 100) + '%';
   requestAnimationFrame(() => {
     const r = ed.stage.getBoundingClientRect();
     ed.ring.width = r.width; ed.ring.height = r.height;
@@ -1510,6 +1537,21 @@ for (const [cls, key, fn] of [['ed-tool', 'tool', setTool], ['ed-label', 'label'
 document.getElementById('ed-zoomin').addEventListener('click', () => setZoom('in'));
 document.getElementById('ed-zoomout').addEventListener('click', () => setZoom('out'));
 document.getElementById('ed-zoomfit').addEventListener('click', () => setZoom('fit'));
+// a trackpad pinch is a ctrl+wheel in Chrome and gesture events in Safari;
+// both would zoom the whole page, here they zoom the image around the cursor
+function pinchAt(e) {
+  const s = ed.stage.getBoundingClientRect();
+  const inside = e.clientX >= s.left && e.clientX <= s.right && e.clientY >= s.top && e.clientY <= s.bottom;
+  return inside ? [e.clientX, e.clientY] : undefined;
+}
+ed.el.addEventListener('wheel', e => {
+  if (!e.ctrlKey) return;
+  e.preventDefault();
+  setZoom(ed.zoom * Math.exp(-e.deltaY / 100), pinchAt(e));
+}, { passive: false });
+let pinchFrom = 1;
+ed.el.addEventListener('gesturestart', e => { e.preventDefault(); pinchFrom = ed.zoom; });
+ed.el.addEventListener('gesturechange', e => { e.preventDefault(); setZoom(pinchFrom * e.scale, pinchAt(e)); });
 ed.sizeEl.addEventListener('input', drawRing);
 ed.undoB.addEventListener('click', edUndo);
 ed.redoB.addEventListener('click', edRedo);
